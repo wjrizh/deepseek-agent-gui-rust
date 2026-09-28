@@ -1,0 +1,20 @@
+# Rust 构建产物
+/target
+/target_local
+vendor/deepseek-agent/target
+
+# 打包产物
+/dist-linux
+/dist-win
+
+# 备份/临时
+/.backup
+/tmp_test_rs_backup.txt
+
+# 依赖与缓存
+node_modules
+**/.playwright-mcp
+
+# 系统文件
+.DS_Store
+*.log

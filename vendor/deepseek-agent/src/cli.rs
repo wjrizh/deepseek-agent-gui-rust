@@ -1,0 +1,1022 @@
+//! 交互式 CLI。
+
+use crate::accounts::AccountManager;
+use crate::auth;
+use crate::Runtime;
+use crate::agent::Agent;
+use crate::agent::session_store::SessionStore;
+use crate::api::chat;
+use crate::api::file;
+use crate::config::Config;
+use crate::error::{AgentError, Result};
+use crate::ui;
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::{Context, Helper};
+use rustyline::validate::Validator;
+
+fn extract_at_paths(input: &str) -> (String, Vec<String>) {
+    let mut text = String::new();
+    let mut paths = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < input.len() {
+        let ch = input[i..].chars().next().unwrap();
+        if ch != '@' {
+            text.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let after = i + 1;
+        if after >= input.len() {
+            text.push('@');
+            break;
+        }
+        let rest = &input[after..];
+        let (path, consumed) = if let Some(stripped) = rest.strip_prefix('"') {
+            match stripped.find('"') {
+                Some(end) => (stripped[..end].to_string(), end + 2),
+                None => {
+                    text.push('@');
+                    i = after;
+                    continue;
+                }
+            }
+} else {
+    // 无引号：读到下一个 '@' 或行尾（允许路径含空格）
+    let end = rest.find('@').unwrap_or(rest.len());
+    (rest[..end].trim_end().to_string(), end)
+};
+        let _ = bytes;
+        paths.push(path);
+        i = after + consumed;
+    }
+    (text.trim().to_string(), paths)
+}
+
+const COMMANDS: &[&str] = &[
+    "/help", "/new", "/sessions", "/switch", "/delete",
+    "/think", "/search", "/free", "/safe", "/account",
+    "exit", "quit",
+];
+
+const HELP_TEXT: &str = "\
+命令：
+  /help              显示本帮助
+  /new               开新会话
+  /sessions          列出在线历史会话（●可续接 / ○仅归档）
+  /switch <id前缀>   切换会话（Tab 可补全）
+  /delete <id...>    删除 1 个或多个会话（前缀匹配，需确认）
+  /think [on|off]    开关思考模式（无参则切换）
+  /search [on|off]   开关联网搜索（无参则切换）
+  /free              自动批准后续命令（免确认）
+  /safe              恢复命令确认
+  /account           列出账号
+  /account add <名>  新增账号（浏览器登录后自动保存）
+  /account del <名>  删除账号
+  /account switch <名>  切换到账号（提示重启）
+  /account rename <旧> <新>  重命名账号
+  exit / quit / 退出  退出
+  @<路径>            内联附加文件，如: 总结 @./doc.pdf（Tab 补全）
+快捷键：
+  Tab                补全命令 / 会话 id";
+
+struct AgentCompleter {
+    sessions: Vec<(String, String)>,
+    accounts: Vec<String>,
+}
+
+fn account_names() -> Vec<String> {
+    AccountManager::load_default()
+        .map(|m| m.list().iter().map(|a| a.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+impl Completer for AgentCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let head = &line[..pos];
+        let start = head
+            .rfind(char::is_whitespace)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let word = &head[start..];
+        let mut out = Vec::new();
+
+        // @路径 补全（含目录列举）
+        if let Some(pfx) = word.strip_prefix('@') {
+            let (dir, name_pfx) = match pfx.rfind('/') {
+                Some(idx) => (&pfx[..=idx], &pfx[idx + 1..]),
+                None => ("", pfx),
+            };
+            let base = if dir.is_empty() { "." } else { dir };
+            if let Ok(rd) = std::fs::read_dir(base) {
+                for entry in rd.flatten() {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    if !fname.starts_with(name_pfx) {
+                        continue;
+                    }
+                    if fname.starts_with('.') && !name_pfx.starts_with('.') {
+                        continue;
+                    }
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let disp = if is_dir {
+                        format!("{fname}/")
+                    } else {
+                        fname.clone()
+                    };
+                    let repl = format!("@{dir}{fname}{}", if is_dir { "/" } else { "" });
+                    out.push(Pair {
+                        display: disp,
+                        replacement: repl,
+                    });
+                }
+            }
+            return Ok((start, out));
+        }
+
+        let head_trim = head[..start].trim_start();
+        if let Some(cmd) = head_trim.split_whitespace().next()
+            && matches!(cmd, "/switch" | "/delete")
+        {
+            let pfx = word.trim();
+            // /switch 已输入 id 后，补 "tree"
+            if cmd == "/switch" {
+                let before = head[..start].trim_end();
+                let tokens: Vec<&str> = before.split_whitespace().collect();
+                if tokens.len() == 2 && "tree".starts_with(pfx) {
+                    out.push(Pair {
+                        display: "tree".to_string(),
+                        replacement: "tree".to_string(),
+                    });
+                    return Ok((start, out));
+                }
+            }
+            for (id, title) in &self.sessions {
+                if id.starts_with(pfx) {
+                    let short = &id[..id.len().min(8)];
+                    let label = if title.is_empty() { "(无标题)" } else { title.as_str() };
+                    out.push(Pair {
+                        display: format!("{short}  {label}"),
+                        replacement: id.clone(),
+                    });
+                }
+            }
+            return Ok((start, out));
+        }
+
+        // /account 子命令 + 账号名补全
+        if let Some(cmd) = head_trim.split_whitespace().next()
+            && cmd == "/account"
+        {
+            let pfx = word.trim();
+            let tokens: Vec<&str> = head[..start].split_whitespace().collect();
+
+            if tokens.len() == 1 {
+                for sub in &["add", "del", "switch", "rename"] {
+                    if sub.starts_with(pfx) {
+                        out.push(Pair {
+                            display: sub.to_string(),
+                            replacement: sub.to_string(),
+                        });
+                    }
+                }
+                return Ok((start, out));
+            }
+
+            let sub = tokens.get(1).copied().unwrap_or("");
+            let arg_index = tokens.len();
+            let should_complete_name = match sub {
+                "del" | "switch" | "rename" => arg_index == 2,
+                _ => false,
+            };
+            if should_complete_name {
+                for name in &self.accounts {
+                    if name.starts_with(pfx) {
+                        out.push(Pair {
+                            display: name.clone(),
+                            replacement: name.clone(),
+                        });
+                    }
+                }
+            }
+            return Ok((start, out));
+        }
+
+        if start == 0 && (word.starts_with('/') || !word.starts_with(' ')) {
+            for c in COMMANDS {
+                if c.starts_with(word) {
+                    out.push(Pair {
+                        display: c.to_string(),
+                        replacement: c.to_string(),
+                    });
+                }
+            }
+        }
+        Ok((start, out))
+    }
+}
+
+impl Helper for AgentCompleter {}
+impl Hinter for AgentCompleter {
+    type Hint = String;
+}
+impl Highlighter for AgentCompleter {}
+impl Validator for AgentCompleter {}
+
+
+/// 交互式新增账号：抓浏览器 token → 存 → 登记
+pub async fn add_account_interactive(name: &str) -> Result<()> {
+    let name = if name.is_empty() {
+        print!("账号名: ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        let mut s = String::new();
+        std::io::stdin()
+            .read_line(&mut s)
+            .map_err(|e| AgentError::Other(e.to_string()))?;
+        s.trim().to_string()
+    } else {
+        name.to_string()
+    };
+    AccountManager::validate_name(&name)?;
+
+    let mut mgr = AccountManager::load_default()?;
+    if mgr.exists(&name) {
+        return Err(AgentError::Config(format!("账号已存在: {name}")));
+    }
+
+    // 账号专属浏览器 profile，实现登录态隔离
+    let profile = mgr.browser_profile(&name);
+
+    println!(
+        "{}[*] 请在弹出的浏览器窗口中登录 DeepSeek 账号「{}」{}",
+        ui::DIM,
+        name,
+        ui::RESET
+    );
+    let token = auth::extract_from_browser(Some(&profile))?;
+
+    mgr.add(&name)?;
+    let rec = auth::TokenRecord::new(token, "browser");
+    let path = mgr.token_file(&name);
+    std::fs::write(&path, serde_json::to_string_pretty(&rec)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    let is_default = mgr.default_account().as_deref() == Some(name.as_str());
+    if is_default {
+        println!(
+            "{}[✓] 账号「{}」已添加并设为默认{}",
+            ui::GREEN,
+            name,
+            ui::RESET
+        );
+    } else {
+        println!(
+            "{}[✓] 账号「{}」已添加{}",
+            ui::GREEN,
+            name,
+            ui::RESET
+        );
+    }
+    Ok(())
+}
+
+async fn switch_account(
+    cfg: &mut Config,
+    rt: &mut Runtime,
+    agent: &mut Agent,
+    name: &str,
+) -> Result<()> {
+    let new_cfg = Config::for_account(name)?;
+    let new_rt = Runtime::new(&new_cfg).await?;
+    let store = SessionStore::load(&new_cfg.session_file);
+    let mut new_agent = Agent::new(new_rt.model()).with_session_store(store);
+    new_agent.set_thinking(agent.thinking());
+    new_agent.set_search(agent.search());
+    new_agent.set_free_mode(agent.free_mode());
+    new_agent.set_compact_threshold(new_cfg.compact_threshold);
+    new_agent.register_tool(Box::new(crate::agent::tool::UploadFile::new(
+        new_rt.http.clone(),
+        new_rt.solver.clone(),
+        new_agent.pending_handle(),
+    )));
+    *cfg = new_cfg;
+    *rt = new_rt;
+    *agent = new_agent;
+    Ok(())
+}
+
+pub async fn run(
+    mut cfg: Config,
+    once: Option<String>,
+    files: Vec<String>,
+    thinking: bool,
+) -> Result<()> {
+    if !ui::trust_menu()? {
+        return Ok(());
+    }
+
+    let mut rt = Runtime::new(&cfg).await?;
+    {
+        let st = rt.interrupt.clone();
+        tokio::spawn(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    continue;
+                }
+                if st.check_double_and_record() {
+                    let _ = crossterm::terminal::disable_raw_mode();
+                    std::process::exit(130);
+                }
+                println!("\n{}^C 再按一次退出{}", ui::DIM, ui::RESET);
+                use std::sync::atomic::Ordering;
+                if crate::agent::tool::TOOL_RUNNING.load(Ordering::Relaxed) {
+                    crate::agent::tool::TOOL_INTERRUPT.store(true, Ordering::Relaxed);
+                } else if st.phase.load(Ordering::Relaxed) == crate::PHASE_MODEL {
+                    let _ = st.cancel.lock().map(|c| c.cancel());
+                }
+            }
+        });
+    }
+    let store = SessionStore::load(&cfg.session_file);
+    let mut agent = Agent::new(rt.model()).with_session_store(store);
+    agent.set_thinking(thinking);
+    agent.set_compact_threshold(cfg.compact_threshold);
+
+    agent.register_tool(Box::new(crate::agent::tool::UploadFile::new(
+        rt.http.clone(),
+        rt.solver.clone(),
+        agent.pending_handle(),
+    )));
+    for f in &files {
+        let mut solver = rt.solver.lock().await;
+        let info = file::upload(&rt.http, &mut solver, f).await?;
+        drop(solver);
+        println!(
+            "{}[*] 已上传: {} ({}){}",
+            ui::DIM,
+            info.file_name,
+            info.id,
+            ui::RESET
+        );
+        agent.attach_file(info.id);
+    }
+
+    if let Some(q) = once {
+        rt.interrupt.mark_phase(crate::PHASE_MODEL);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _ = rt.interrupt.cancel.lock().map(|mut c| *c = cancel.clone());
+        let _ = agent.run_with_cancel(&q, cancel).await?;
+        rt.interrupt.mark_phase(crate::PHASE_IDLE);
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    ui::print_logo(&cwd, cfg.account.as_deref());
+
+    let _ = crossterm::terminal::disable_raw_mode();
+
+    let sessions = match chat::list_sessions(&rt.http).await {
+        Ok(l) => l.into_iter().map(|s| (s.id, s.title)).collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    let helper = AgentCompleter { sessions, accounts: account_names() };
+    let mut rl = rustyline::Editor::with_config(
+        rustyline::Config::builder()
+            .completion_type(rustyline::CompletionType::List)
+            .build(),
+    )
+    .map_err(|e| AgentError::Other(format!("readline: {e}")))?;
+    rl.set_helper(Some(helper));
+    let prompt_str = format!("{}❯{} ", ui::GREEN, ui::RESET);
+
+    loop {
+        match rl.readline(&prompt_str) {
+            Ok(line) => {
+                let q = line.trim();
+                if q.is_empty() {
+                    continue;
+                }
+                if matches!(q, "exit" | "quit" | "退出") {
+                    break;
+                }
+                if q == "/account" || q.starts_with("/account ") {
+                    let arg = q.strip_prefix("/account").unwrap().trim();
+                    let parts: Vec<&str> = arg.split_whitespace().collect();
+                    let mut mgr = AccountManager::load_default()?;
+                    let cur = cfg.account.clone();
+
+                    match parts.as_slice() {
+                        [] => {
+                            for a in mgr.list() {
+                                let mark = if Some(&a.name) == cur.as_ref() {
+                                    "●"
+                                } else {
+                                    " "
+                                };
+                                println!(
+                                    "{}{} {}{}",
+                                    ui::CYAN,
+                                    mark,
+                                    a.name,
+                                    ui::RESET
+                                );
+                            }
+                        }
+                        ["add", name] => {
+                            add_account_interactive(name).await?;
+                        }
+                        ["del", name] => {
+                            if !mgr.exists(name) {
+                                eprintln!(
+                                    "{}[!] 账号不存在: {}{}",
+                                    ui::RED,
+                                    name,
+                                    ui::RESET
+                                );
+                                continue;
+                            }
+                            let confirmed = matches!(
+                                ui::select_menu(
+                                    &format!("删除账号「{name}」及其所有会话？"),
+                                    &["确认删除", "取消"]
+                                ),
+                                Ok(0)
+                            );
+                            if confirmed {
+                                mgr.remove(name)?;
+                                println!(
+                                    "{}[✓] 已删除账号 {}{}",
+                                    ui::GREEN,
+                                    name,
+                                    ui::RESET
+                                );
+                            }
+                        }
+                        ["switch", name] => {
+                            if !mgr.exists(name) {
+                                eprintln!(
+                                    "{}[!] 账号不存在: {}{}",
+                                    ui::RED,
+                                    name,
+                                    ui::RESET
+                                );
+                                continue;
+                            }
+                            if cur.as_deref() == Some(name) {
+                                println!(
+                                    "{}[·] 已经是当前账号「{}」{}",
+                                    ui::DIM,
+                                    name,
+                                    ui::RESET
+                                );
+                                continue;
+                            }
+                            match switch_account(&mut cfg, &mut rt, &mut agent, name).await {
+                                Ok(()) => {
+                                    let sessions = match chat::list_sessions(&rt.http).await {
+                                        Ok(l) => l.into_iter().map(|s| (s.id, s.title)).collect(),
+                                        Err(_) => Vec::new(),
+                                    };
+                                    rl.set_helper(Some(AgentCompleter {
+                                        sessions,
+                                        accounts: account_names(),
+                                    }));
+                                    let cwd = std::env::current_dir()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_default();
+                                    ui::print_logo(&cwd, cfg.account.as_deref());
+                                    println!(
+                                        "{}[✓] 已切换到账号「{}」{}",
+                                        ui::GREEN,
+                                        name,
+                                        ui::RESET
+                                    );
+                                }
+                                Err(e) => eprintln!("{}[!] 切换失败: {e}{}", ui::RED, ui::RESET),
+                            }
+                        }
+                        ["rename", old, new] => {
+                            if !mgr.exists(old) {
+                                eprintln!("{}[!] 账号不存在: {}{}", ui::RED, old, ui::RESET);
+                                continue;
+                            }
+                            if mgr.exists(new) {
+                                eprintln!("{}[!] 目标名已存在: {}{}", ui::RED, new, ui::RESET);
+                                continue;
+                            }
+                            match mgr.rename(old, new) {
+                                Ok(()) => {
+                                    println!(
+                                        "{}[✓] 账号「{}」已改名为「{}」{}",
+                                        ui::GREEN, old, new, ui::RESET
+                                    );
+                                    if cur.as_deref() == Some(old) {
+                                        println!(
+                                            "{}[!] 当前进程仍绑定旧账号，请重启：lg2 --account {}{}",
+                                            ui::DIM, new, ui::RESET
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!("{}[!] 改名失败: {e}{}", ui::RED, ui::RESET),
+                            }
+                        }
+                        _ => {
+                            println!(
+                                "{}用法: /account | /account add <名> | /account del <名> | /account rename <旧> <新> | /account switch <名>{}",
+                                ui::DIM,
+                                ui::RESET
+                            );
+                        }
+                    }
+                    continue;
+                }
+                if q == "/help" {
+                    println!("{}{}{}", ui::CYAN, HELP_TEXT, ui::RESET);
+                    continue;
+                }
+                if let Some(rest) = q.strip_prefix("/think") {
+                    let arg = rest.trim();
+                    let on = match arg {
+                        "on" => true,
+                        "off" => false,
+                        "" => !agent.thinking(),
+                        _ => {
+                            eprintln!("{}[!] 用法: /think [on|off]{}", ui::RED, ui::RESET);
+                            continue;
+                        }
+                    };
+                    agent.set_thinking(on);
+                    println!(
+                        "{}[✓] 思考模式: {}{}",
+                        ui::GREEN,
+                        if on { "开" } else { "关" },
+                        ui::RESET
+                    );
+                    continue;
+                }
+                if let Some(rest) = q.strip_prefix("/search") {
+                    let arg = rest.trim();
+                    let on = match arg {
+                        "on" => true,
+                        "off" => false,
+                        "" => !agent.search(),
+                        _ => {
+                            eprintln!("{}[!] 用法: /search [on|off]{}", ui::RED, ui::RESET);
+                            continue;
+                        }
+                    };
+                    agent.set_search(on);
+                    println!(
+                        "{}[✓] 联网搜索: {}{}",
+                        ui::GREEN,
+                        if on { "开" } else { "关" },
+                        ui::RESET
+                    );
+                    continue;
+                }
+                if q == "/free" {
+                    agent.set_free_mode(true);
+                    println!(
+                        "{}[✓] /free 已开启：后续命令自动批准{}",
+                        ui::GREEN,
+                        ui::RESET
+                    );
+                    continue;
+                }
+                if q == "/safe" {
+                    agent.set_free_mode(false);
+                    println!("{}[✓] 已切回安全模式：命令需确认{}", ui::GREEN, ui::RESET);
+                    continue;
+                }
+                if q == "/new" {
+                    match agent.new_session().await {
+                        Ok(id) => {
+                            println!(
+                                "{}[✓] 已开新会话 {}{}",
+                                ui::GREEN,
+                                &id[..id.len().min(8)],
+                                ui::RESET
+                            );
+                            let sessions = match chat::list_sessions(&rt.http).await {
+                                Ok(l) => l.into_iter().map(|s| (s.id, s.title)).collect(),
+                                Err(_) => Vec::new(),
+                            };
+                            rl.set_helper(Some(AgentCompleter { sessions, accounts: account_names() }));
+                        }
+                        Err(e) => eprintln!("{}[!] 新建失败: {e}{}", ui::RED, ui::RESET),
+                    }
+                    continue;
+                }
+                if q == "/sessions" {
+                    match chat::list_sessions(&rt.http).await {
+                        Ok(list) => {
+                            if list.is_empty() {
+                                println!("{}（无历史会话）{}", ui::DIM, ui::RESET);
+                            }
+                            for s in &list {
+                                let mark = if agent.store_contains(&s.id) {
+                                    "●"
+                                } else {
+                                    "○"
+                                };
+                                let short = &s.id[..s.id.len().min(8)];
+                                let title = if s.title.is_empty() {
+                                    "(无标题)"
+                                } else {
+                                    &s.title
+                                };
+                                println!(
+                                    "{}{} {}  {}{}{}",
+                                    ui::CYAN,
+                                    mark,
+                                    short,
+                                    title,
+                                    ui::DIM,
+                                    if s.pinned { " [置顶]" } else { "" }
+                                );
+                                print!("{}", ui::RESET);
+                            }
+                            println!(
+                                "{}(● = 有本地上下文可完美续接 · ○ = 仅归档){}",
+                                ui::DIM,
+                                ui::RESET
+                            );
+                            let sessions = list.iter().map(|s| (s.id.clone(), s.title.clone())).collect();
+                            rl.set_helper(Some(AgentCompleter { sessions, accounts: account_names() }));
+                        }
+                        Err(e) => eprintln!("{}[!] 获取会话列表失败: {e}{}", ui::RED, ui::RESET),
+                    }
+                    continue;
+                }
+                if let Some(arg) = q.strip_prefix("/switch ") {
+                    let arg = arg.trim();
+                    // 解析「<id前缀> [tree]」
+                    let mut parts = arg.split_whitespace();
+                    let id_arg = parts.next().unwrap_or("").to_string();
+                    let want_tree = parts.next() == Some("tree");
+                    match chat::list_sessions(&rt.http).await {
+                        Ok(list) => {
+                            let hits: Vec<_> = list
+                                .iter()
+                                .filter(|s| s.id.starts_with(&id_arg))
+                                .collect();
+                            let target = match hits.as_slice() {
+                                [] => {
+                                    eprintln!(
+                                        "{}[!] 无匹配会话: {}{}",
+                                        ui::RED, arg, ui::RESET
+                                    );
+                                    continue;
+                                }
+                                [one] => (*one).clone(),
+                                _ => {
+                                    eprintln!(
+                                        "{}[!] 前缀不唯一，匹配 {} 个，请补全{}",
+                                        ui::RED,
+                                        hits.len(),
+                                        ui::RESET
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            // /switch <id> tree —— 列出分支供选择
+                            if want_tree {
+                                match chat::session_branches(&rt.http, &target.id).await {
+                                    Ok(branches) if !branches.is_empty() => {
+                                        println!(
+                                            "{}会话 {} · {} 个分支{}",
+                                            ui::DIM,
+                                            &target.id[..target.id.len().min(8)],
+                                            branches.len(),
+                                            ui::RESET
+                                        );
+                                        let mut options: Vec<String> = Vec::new();
+                                        for (i, b) in branches.iter().enumerate() {
+                                            let mark = if b.is_current { "●" } else { " " };
+                                            let label = format!(
+                                                "[{}] {} {} · {}（{} 条）",
+                                                i + 1,
+                                                mark,
+                                                b.leaf_mid,
+                                                if b.summary.is_empty() { "(空)".into() } else { b.summary.clone() },
+                                                b.size
+                                            );
+                                            options.push(label);
+                                        }
+                                        let opts_ref: Vec<&str> =
+                                            options.iter().map(|s| s.as_str()).collect();
+                                        match crate::ui::select_menu("选择要续接的分支：", &opts_ref) {
+                                            Ok(idx) => {
+                                                let chosen = &branches[idx];
+                                                let parent = Some(chosen.leaf_mid);
+                                                match agent.switch_session(target.id.clone(), parent) {
+                                                    Ok(()) => println!(
+                                                        "{}[✓] 已切到分支 mid={} · {}{}",
+                                                        ui::GREEN,
+                                                        chosen.leaf_mid,
+                                                        chosen.summary,
+                                                        ui::RESET
+                                                    ),
+                                                    Err(e) => eprintln!(
+                                                        "{}[!] 切换失败: {e}{}",
+                                                        ui::RED,
+                                                        ui::RESET
+                                                    ),
+                                                }
+                                            }
+                                            Err(_) => println!("{}已取消{}", ui::DIM, ui::RESET),
+                                        }
+                                    }
+                                    Ok(_) => println!("{}(该会话无分支){}", ui::DIM, ui::RESET),
+                                    Err(e) => eprintln!(
+                                        "{}[!] 拉取分支失败: {e}{}",
+                                        ui::RED,
+                                        ui::RESET
+                                    ),
+                                }
+                                continue;
+                            }
+
+                            let local_parent = agent.store_parent_of(&target.id);
+                            let (online_latest, recent) =
+                                match chat::history_tail(&rt.http, &target.id, 3).await {
+                                    Ok(x) => (x.0, x.1),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "{}[!] 拉取历史失败: {e}{}",
+                                            ui::RED,
+                                            ui::RESET
+                                        );
+                                        continue;
+                                    }
+                                };
+                            let parent = local_parent.or(online_latest);
+                            if parent.is_none() {
+                                eprintln!(
+                                    "{}[!] 该会话无可续接的 parent，将从新开始（历史仍在服务端）{}",
+                                    ui::RED,
+                                    ui::RESET
+                                );
+                            }
+                            match agent.switch_session(target.id.clone(), parent) {
+                                Ok(()) => {
+                                    println!(
+                                        "{}[✓] 已切换到 {} · {}{}",
+                                        ui::GREEN,
+                                        &target.id[..target.id.len().min(8)],
+                                        target.title,
+                                        ui::RESET
+                                    );
+                                    if !recent.is_empty() {
+                                        println!(
+                                            "{}── 最近 {} 条 ──{}",
+                                            ui::DIM,
+                                            recent.len(),
+                                            ui::RESET
+                                        );
+                                        for m in &recent {
+                                            let who = match m.role.as_str() {
+                                                "USER" => "你",
+                                                "ASSISTANT" => "ligong",
+                                                _ => &m.role,
+                                            };
+                                            let color = if m.role == "USER" {
+                                                ui::CYAN
+                                            } else {
+                                                ui::GREEN
+                                            };
+                                            let raw = if m.role == "USER" {
+                                                let seg = m
+                                                    .content
+                                                    .rsplit("\n\n")
+                                                    .next()
+                                                    .unwrap_or(&m.content);
+                                                if seg.chars().count() > 200 {
+                                                    seg.chars().take(200).collect()
+                                                } else {
+                                                    seg.to_string()
+                                                }
+                                            } else {
+                                                m.content.clone()
+                                            };
+                                            let cleaned = raw.replace('\n', " ");
+                                            let total = cleaned.chars().count();
+                                            let mut text: String =
+                                                cleaned.trim().chars().take(80).collect();
+                                            if total > 80 {
+                                                text.push('…');
+                                            }
+                                            println!(
+                                                "{}{} > {}{}",
+                                                color, who, text, ui::RESET
+                                            );
+                                        }
+                                    } else {
+                                        println!(
+                                            "{}(该会话无历史消息){}",
+                                            ui::DIM,
+                                            ui::RESET
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}[!] 切换失败: {e}{}",
+                                        ui::RED,
+                                        ui::RESET
+                                    )
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "{}[!] 获取会话列表失败: {e}{}",
+                            ui::RED,
+                            ui::RESET
+                        ),
+                    }
+                    continue;
+                }
+                if let Some(arg) = q.strip_prefix("/delete ") {
+                    let prefixes: Vec<&str> = arg.split_whitespace().collect();
+                    if prefixes.is_empty() {
+                        println!("{}用法: /delete <id前缀> [id前缀...]{}", ui::DIM, ui::RESET);
+                        continue;
+                    }
+                    let list = match chat::list_sessions(&rt.http).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("{}[!] 获取会话列表失败: {e}{}", ui::RED, ui::RESET);
+                            continue;
+                        }
+                    };
+                    let mut targets: Vec<chat::OnlineSession> = Vec::new();
+                    let mut bad = false;
+                    for pfx in &prefixes {
+                        let hits: Vec<_> =
+                            list.iter().filter(|s| s.id.starts_with(pfx)).collect();
+                        match hits.as_slice() {
+                            [] => {
+                                eprintln!("{}[!] 无匹配: {}{}", ui::RED, pfx, ui::RESET);
+                                bad = true;
+                            }
+                            [one] => {
+                                if !targets.iter().any(|t| t.id == one.id) {
+                                    targets.push((*one).clone());
+                                }
+                            }
+                            _ => {
+                                eprintln!(
+                                    "{}[!] 前缀不唯一: {}（匹配 {} 个）{}",
+                                    ui::RED, pfx, hits.len(), ui::RESET
+                                );
+                                bad = true;
+                            }
+                        }
+                    }
+                    if bad || targets.is_empty() {
+                        continue;
+                    }
+                    let mut prompt = format!(
+                        "{}将删除以下 {} 个会话（不可恢复）：{}",
+                        ui::RED,
+                        targets.len(),
+                        ui::RESET
+                    );
+                    for t in &targets {
+                        prompt.push_str(&format!(
+                            "\n  {}{}  {}{}",
+                            ui::CYAN,
+                            &t.id[..t.id.len().min(8)],
+                            t.title,
+                            ui::RESET
+                        ));
+                    }
+                    let confirmed = matches!(ui::select_menu(&prompt, &["确认删除", "取消"]), Ok(0));
+                    if !confirmed {
+                        println!("{}已取消{}", ui::DIM, ui::RESET);
+                        continue;
+                    }
+                    let current = agent.session_id().map(|s| s.to_string());
+                    let mut deleted_current = false;
+                    for t in &targets {
+                        match chat::delete_session(&rt.http, &t.id).await {
+                            Ok(()) => {
+                                let _ = agent.store_remove(&t.id);
+                                if current.as_deref() == Some(t.id.as_str()) {
+                                    deleted_current = true;
+                                }
+                                println!(
+                                    "{}[✓] 已删除 {}{}",
+                                    ui::GREEN,
+                                    &t.id[..t.id.len().min(8)],
+                                    ui::RESET
+                                );
+                            }
+                            Err(e) => eprintln!(
+                                "{}[!] 删除 {} 失败: {e}{}",
+                                ui::RED,
+                                &t.id[..t.id.len().min(8)],
+                                ui::RESET
+                            ),
+                        }
+                    }
+                    if deleted_current {
+                        match agent.new_session().await {
+                            Ok(id) => println!(
+                                "{}[✓] 当前会话已删，已开新会话 {}{}",
+                                ui::GREEN,
+                                &id[..id.len().min(8)],
+                                ui::RESET
+                            ),
+                            Err(e) => {
+                                eprintln!("{}[!] 新建失败: {e}{}", ui::RED, ui::RESET)
+                            }
+                        }
+                    }
+                    let sessions = match chat::list_sessions(&rt.http).await {
+                        Ok(l) => l.into_iter().map(|s| (s.id, s.title)).collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    rl.set_helper(Some(AgentCompleter { sessions, accounts: account_names() }));
+                    continue;
+                }
+                let _ = rl.add_history_entry(q);
+
+                let (text, paths) = extract_at_paths(q);
+                for p in &paths {
+                    let path = std::path::Path::new(p);
+                    if !path.exists() {
+                        eprintln!("{}[!] 文件不存在: {}{}", ui::RED, p, ui::RESET);
+                        continue;
+                    }
+                    let mut solver = rt.solver.lock().await;
+                    let r = file::upload(&rt.http, &mut solver, path).await;
+                    drop(solver);
+                    match r {
+                        Ok(info) => {
+                            println!(
+                                "{}[*] 已附加: {} ({}){}",
+                                ui::DIM, info.file_name, info.id, ui::RESET
+                            );
+                            agent.attach_file(info.id);
+                        }
+                        Err(e) => {
+                            eprintln!("{}[!] 上传失败 {}: {e}{}", ui::RED, p, ui::RESET)
+                        }
+                    }
+                }
+                let final_input = if text.is_empty() && !paths.is_empty() {
+                    "请分析我上传的文件".to_string()
+                } else {
+                    text
+                };
+                if final_input.is_empty() {
+                    continue;
+                }
+                rt.interrupt.mark_phase(crate::PHASE_MODEL);
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let _ = rt.interrupt.cancel.lock().map(|mut c| *c = cancel.clone());
+
+                // 交接/无命令回复的优先级与阈值判断统一在 core 的每轮循环内处理。
+                let outcome = agent.run_with_cancel(&final_input, cancel).await;
+                rt.interrupt.mark_phase(crate::PHASE_IDLE);
+                match outcome {
+                    Ok(crate::agent::core::RunOutcome::Interrupted) => {}
+                    Ok(crate::agent::core::RunOutcome::Done(_)) => {}
+                    Err(e) => {
+                        eprintln!("{}[!] 出错: {}{}", ui::RED, e, ui::RESET);
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                if rt.interrupt.check_double_and_record() {
+                    break;
+                }
+                println!("{}^C 再按一次退出{}", ui::DIM, ui::RESET);
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("{}[!] 输入错误: {}{}", ui::RED, e, ui::RESET);
+                break;
+            }
+        }
+    }
+    println!("{}[*] 结束{}", ui::DIM, ui::RESET);
+    Ok(())
+}
