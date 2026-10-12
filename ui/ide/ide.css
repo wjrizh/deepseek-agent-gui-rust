@@ -829,3 +829,63 @@ html, body {
   width: 7px; height: 7px; border-radius: 50%;
   background: #4a9eff; margin-left: 6px; flex: 0 0 auto;
 }
+
+/* —— 底部终端面板 —— */
+.terminal-panel {
+  display: flex;
+  flex-direction: column;
+  height: 260px;
+  min-height: 80px;
+  border-top: 1px solid var(--border, #333);
+  background: #1e1e1e;
+  position: relative;
+}
+.terminal-panel.resizing { user-select: none; }
+.term-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 30px;
+  padding: 0 6px;
+  background: #252526;
+  border-bottom: 1px solid #333;
+  flex: 0 0 auto;
+}
+.term-tabs { display: flex; gap: 2px; overflow-x: auto; }
+.term-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: #bbb;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  border-radius: 4px 4px 0 0;
+}
+.term-tab.active { color: #fff; background: #1e1e1e; }
+.term-tab .term-close { opacity: .6; font-size: 11px; }
+.term-tab .term-close:hover { opacity: 1; }
+.term-actions { display: flex; gap: 4px; }
+.term-btn {
+  background: transparent;
+  border: none;
+  color: #ccc;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.term-btn:hover { background: #3a3d41; }
+.term-hosts { flex: 1 1 auto; position: relative; overflow: hidden; }
+.term-host { position: absolute; inset: 0; display: none; }
+.term-host.active { display: block; }
+.term-host .xterm { padding: 4px; height: 100%; }
+.term-resizer {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 4px;
+  cursor: ns-resize;
+  z-index: 5;
+}

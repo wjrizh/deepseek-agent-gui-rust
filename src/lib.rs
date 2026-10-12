@@ -50,6 +50,7 @@ pub fn run() {
             Ok(())
         })
         .manage(state::AppState::default())
+        .manage(ide::term::TermState::default())
         .invoke_handler(tauri::generate_handler![
             commands::account_status,
             commands::list_accounts,
@@ -134,6 +135,10 @@ pub fn run() {
             ide::git::ide_git_log,
             ide::git::ide_git_show,
             ide::git::ide_git_reset,
+            ide::term::term_open,
+            ide::term::term_write,
+            ide::term::term_resize,
+            ide::term::term_close,
             ide::preview::ide_read_binary,
             ide::preview::ide_open_external,
             ide::window::open_ide_window,

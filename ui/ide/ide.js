@@ -12,6 +12,7 @@ import {
   gitInit, gitFetch, gitClone, gitMerge, gitMergeAbort, gitResolve,
   gitStashPush, gitStashList, gitStashOp, gitFileLog, gitBlame,
 } from "./api.js";
+import { initTerminal, toggleTerminal } from "./term.js";
 
 // 剪贴板：仅记录一次复制/剪切操作的相对路径，粘贴时读取。
 let clip = null; // { items: [{rel, isDir}], mode: "copy" | "cut" }
@@ -1697,6 +1698,12 @@ async function boot() {
       save();
     }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "w") { e.preventDefault(); if (activeRel) closeTab(activeRel); }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "t") {
+      // 终端内聚焦时不拦截，交由 shell 处理 Ctrl+T。
+      if (e.target.closest && e.target.closest(".terminal-panel")) return;
+      e.preventDefault();
+      toggleTerminal();
+    }
   });
 
   document.querySelectorAll("[data-win]").forEach((b) => {
@@ -1725,6 +1732,7 @@ async function boot() {
   installScm();
   installFsWatch();
   installAgentDiffWatch();
+  initTerminal({ projectId, cwdProvider: () => projectRootAbs || "" });
   refreshGit();
 }
 

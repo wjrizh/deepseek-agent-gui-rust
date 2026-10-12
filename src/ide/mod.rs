@@ -9,5 +9,6 @@ pub mod fs;
 pub mod git;
 pub mod path;
 pub mod preview;
+pub mod term;
 pub mod watch;
 pub mod window;

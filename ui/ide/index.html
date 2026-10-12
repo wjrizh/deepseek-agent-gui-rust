@@ -128,6 +128,16 @@
         </div>
         <div id="diff-host" class="diff-host hidden"></div>
       </div>
+      <div id="terminal-panel" class="terminal-panel hidden">
+        <div class="term-head">
+          <div id="term-tabs" class="term-tabs"></div>
+          <div class="term-actions">
+            <button id="term-new" class="term-btn" title="新建终端">＋</button>
+            <button id="term-hide" class="term-btn" title="隐藏终端">✕</button>
+          </div>
+        </div>
+        <div id="term-hosts" class="term-hosts"></div>
+      </div>
       <div id="statusbar" class="statusbar">
         <span id="status-path">就绪</span>
         <span id="status-meta"></span>
@@ -150,6 +160,7 @@
     </div>
   </div>
 
+  <link rel="stylesheet" href="../vendor/xterm/xterm.css" />
   <script src="../vendor/monaco/vs/loader.js"></script>
   <script type="module" src="ide.js"></script>
 </body>

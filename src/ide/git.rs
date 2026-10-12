@@ -202,6 +202,23 @@ pub async fn ide_git_diff(
     if !ok {
         return Err(format!("git diff 失败：{}", err.trim()));
     }
+    if !out.trim().is_empty() {
+        return Ok(out);
+    }
+    // 未跟踪文件不在 `git diff` 输出中：对空文件做 no-index 对比，展示全部新增行。
+    let tracked = run_git(&root, &["ls-files", "--error-unmatch", "--", &rel_path])
+        .map(|(ok, _, _)| ok)
+        .unwrap_or(false);
+    if !tracked && !staged {
+        let full = root.join(&rel_path);
+        let full_str = full.to_string_lossy().to_string();
+        // no-index 有差异时退出码为 1，属正常；用 /dev/null 作原侧。
+        let (_, ni_out, _) = run_git(
+            &root,
+            &["diff", "--no-color", "--no-ext-diff", "--no-index", "/dev/null", &full_str],
+        )?;
+        return Ok(ni_out);
+    }
     Ok(out)
 }
 

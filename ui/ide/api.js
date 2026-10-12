@@ -172,3 +172,24 @@ export function getRestrict(projectId) {
 export function setRestrict(projectId, on) {
   return invoke("set_restrict", { projectId, on });
 }
+
+// —— 内置终端 ——
+const ChannelCtor = window.__TAURI__.core.Channel;
+
+export function termOpen(id, cwd, shell, cols, rows, onEvent) {
+  const channel = new ChannelCtor();
+  channel.onmessage = onEvent;
+  return invoke("term_open", { id, cwd: cwd || null, shell: shell || null, cols, rows, onEvent: channel });
+}
+
+export function termWrite(id, data) {
+  return invoke("term_write", { id, data });
+}
+
+export function termResize(id, cols, rows) {
+  return invoke("term_resize", { id, cols, rows });
+}
+
+export function termClose(id) {
+  return invoke("term_close", { id });
+}

@@ -23,6 +23,7 @@ tokio-tungstenite = "0.24"
 deepseek-agent = { path = "vendor/deepseek-agent" }
 base64 = "0.22"
 notify = "7.0.0"
+portable-pty = "0.9.0"
 
 [lib]
 name = "deepseek_agent_gui_rust_lib"
