@@ -56,8 +56,17 @@
           <span class="sidebar-title">源代码管理</span>
           <div class="sidebar-actions">
             <span id="scm-branch" class="scm-branch hidden"></span>
+            <span id="scm-sync" class="scm-sync hidden"></span>
             <button id="scm-refresh-btn" class="icon-btn" title="刷新">⟳</button>
           </div>
+        </div>
+        <div id="scm-toolbar" class="scm-toolbar hidden">
+          <button id="scm-stage-all" class="scm-tool" title="全部暂存">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
+          <button id="scm-unstage-all" class="scm-tool" title="全部取消暂存">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none"><path d="M5 12h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
         </div>
         <div id="scm-body" class="scm-body">
           <div id="scm-empty" class="scm-empty">未检测到 Git 仓库</div>
@@ -73,9 +82,6 @@
         </div>
       </div>
     </aside>
-
-    <!-- 拖拽分隔条 -->
-    <div id="splitter" class="splitter"></div>
 
     <!-- 拖拽分隔条 -->
     <div id="splitter" class="splitter"></div>

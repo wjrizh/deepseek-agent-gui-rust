@@ -169,37 +169,84 @@ html, body {
 .scm-pane { flex: 1 1 50%; border-top: 1px solid var(--border); }
 
 /* ---------- 源代码管理 ---------- */
+.scm-head { padding-bottom: 6px; }
 .scm-branch {
-  font-size: 11px; font-weight: 600; letter-spacing: 0;
-  text-transform: none; color: var(--accent);
-  background: var(--accent-soft); border-radius: 6px; padding: 1px 6px;
-  max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 11px; font-weight: 600; color: var(--fg);
+  background: var(--bg-elev2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 1px 7px; max-width: 140px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.scm-branch svg { flex-shrink: 0; }
+.scm-sync { display: inline-flex; gap: 2px; color: var(--fg-dim); font-size: 11px; }
+.scm-sync .ahead { color: #4fae6d; }
+.scm-sync .behind { color: #e2b341; }
+
+/* 工具条 */
+.scm-toolbar {
+  display: flex; align-items: center; gap: 2px;
+  padding: 0 10px 6px;
+}
+.scm-tool {
+  border: none; background: transparent; color: var(--fg-dim);
+  cursor: pointer; width: 24px; height: 24px; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.scm-tool:hover { background: var(--tree-hover); color: var(--fg); }
+.scm-tool:disabled { opacity: .35; cursor: default; }
+
 .scm-body { flex: 1; overflow: auto; display: flex; flex-direction: column; padding-bottom: 6px; }
 .scm-empty, .scm-clean { padding: 10px 14px; color: var(--fg-faint); font-size: 12px; }
 .scm-groups { flex: 1; }
+
+/* 分组头（可折叠） */
 .scm-group-head {
-  padding: 6px 14px 2px; color: var(--fg-dim);
-  font-size: 11px; font-weight: 700; letter-spacing: .04em;
-}
-.scm-row {
   display: flex; align-items: center; gap: 4px;
-  padding: 3px 10px 3px 14px; cursor: pointer; font-size: 13px;
+  padding: 5px 12px; cursor: pointer; user-select: none;
+  color: var(--fg-dim); font-size: 11px; font-weight: 700; letter-spacing: .04em;
+}
+.scm-group-head:hover { background: var(--tree-hover); }
+.scm-group-head .chev {
+  display: inline-flex; transition: transform .12s ease; color: var(--fg-faint);
+}
+.scm-group-head.collapsed .chev { transform: rotate(-90deg); }
+.scm-group-head .cnt { color: var(--fg-faint); font-weight: 500; }
+
+/* 行 */
+.scm-row {
+  display: flex; align-items: center; gap: 5px;
+  padding: 2px 8px 2px 18px; cursor: pointer; font-size: 13px;
   border-radius: 6px; margin: 0 6px;
 }
 .scm-row:hover { background: var(--tree-hover); }
+.scm-icon { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.scm-icon svg { display: block; }
 .scm-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .scm-dir {
   flex: 1; min-width: 0; color: var(--fg-faint); font-size: 11px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.scm-acts { display: flex; gap: 2px; opacity: 0; }
+.scm-acts { display: flex; gap: 1px; opacity: 0; flex-shrink: 0; }
 .scm-row:hover .scm-acts { opacity: 1; }
 .scm-act {
   border: none; background: transparent; color: var(--fg-dim);
-  cursor: pointer; font-size: 13px; border-radius: 5px; padding: 1px 5px;
+  cursor: pointer; width: 20px; height: 20px; border-radius: 5px;
+  display: inline-flex; align-items: center; justify-content: center; padding: 0;
 }
 .scm-act:hover { background: var(--accent-soft); color: var(--fg); }
+
+/* 状态字母徽章 */
+.scm-code {
+  flex-shrink: 0; font-size: 11px; font-weight: 700; font-family: monospace;
+  width: 14px; text-align: center;
+}
+.scm-code.M { color: #e2b341; }
+.scm-code.A { color: #4fae6d; }
+.scm-code.U { color: #4fae6d; }
+.scm-code.D { color: #ff6b6b; }
+.scm-code.R { color: #5b8cff; }
+.scm-code.C { color: #56c8d8; }
+
 .scm-commit-wrap { padding: 8px 10px; border-top: 1px solid var(--border); }
 .scm-message {
   width: 100%; resize: vertical; min-height: 44px;

@@ -46,6 +46,11 @@ function normRel(rel) {
   return out.join("/");
 }
 
+// 供其他模块（如源代码管理面板）按文件名取图标。
+export function fileIcon(name) {
+  return iconFor({ name, is_dir: false }, false);
+}
+
 export function createTree(host, projectId, onOpenFile, restrict, opts = {}) {
   const state = new Map(); // rel -> { expanded }
   let rootRel = "";        // 当前显示根（相对工作目录）

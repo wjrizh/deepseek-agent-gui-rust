@@ -1,6 +1,6 @@
 // IDE 入口：项目信息、多标签编辑器、文件树、保存与快捷键。
 
-import { createTree } from "./tree.js";
+import { createTree, fileIcon } from "./tree.js";
 import { createEditor, langForPath } from "./editor.js";
 import { renderPreview, previewKind } from "./viewer.js";
 import {
@@ -46,6 +46,10 @@ const els = {
   btnGitDiffMode: document.getElementById("btn-git-diff-mode"),
   btnCloseGitDiff: document.getElementById("btn-close-git-diff"),
   scmBranch: document.getElementById("scm-branch"),
+  scmSync: document.getElementById("scm-sync"),
+  scmToolbar: document.getElementById("scm-toolbar"),
+  scmStageAll: document.getElementById("scm-stage-all"),
+  scmUnstageAll: document.getElementById("scm-unstage-all"),
   scmBody: document.getElementById("scm-body"),
   scmEmpty: document.getElementById("scm-empty"),
   scmGroups: document.getElementById("scm-groups"),
@@ -56,6 +60,13 @@ const els = {
   scmPushBtn: document.getElementById("scm-push-btn"),
   scmRefreshBtn: document.getElementById("scm-refresh-btn"),
 };
+
+// 图标
+const SVG_BRANCH = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none"><circle cx="7" cy="6" r="2.2" stroke="currentColor" stroke-width="1.5"/><circle cx="7" cy="18" r="2.2" stroke="currentColor" stroke-width="1.5"/><circle cx="17" cy="9" r="2.2" stroke="currentColor" stroke-width="1.5"/><path d="M7 8.2v7.6M17 11.2c0 3-2.5 4-6 4.3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+const SVG_CHEVRON = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const SVG_PLUS = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>';
+const SVG_MINUS = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none"><path d="M5 12h14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>';
+const SVG_DISCARD = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none"><path d="M9 7L4 12l5 5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 12h9a6 6 0 010 12h-2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 let editor = null;       // Monaco editor 实例
 let monaco = null;       // monaco 命名空间
@@ -286,6 +297,9 @@ let gitState = null;         // 最近一次 GitStatus
 let gitDiffActive = false;   // 当前是否展示 Git diff
 let gitDiffKey = null;       // 当前 diff 的 rel + staged 标识
 
+// 折叠状态：分组标签 -> 是否收起
+const scmCollapsed = new Set();
+
 // rel -> { staged, worktree, untracked, conflicted }
 function gitFileMap() {
   const m = new Map();
@@ -293,13 +307,31 @@ function gitFileMap() {
   return m;
 }
 
-// 从状态的 XY 码推断单字符展示态：M/A/D/R/U/?
-function gitDecor(gf) {
+// 计算状态字母与语义类别：M/A/D/R/U/C
+function gitCode(gf) {
   if (!gf) return "";
-  if (gf.conflicted) return "U";
+  if (gf.conflicted) return "C";
   if (gf.untracked) return "U";
-  const c = gf.worktree !== " " && gf.worktree !== "" ? gf.worktree : gf.staged;
-  return c && c !== " " ? c : "M";
+  const s = gf.staged, w = gf.worktree;
+  const staged = s !== " " && s !== "";
+  const worktree = w !== " " && w !== "";
+  if (staged && worktree) return s === "A" ? "A" : "M";
+  if (staged) return s;            // A/D/R/M
+  if (worktree) return w === "D" ? "D" : "M";
+  return "M";
+}
+
+// 供文件树/标签使用。
+function gitDecor(gf) { return gitCode(gf); }
+
+function gitStatusClass(gf) {
+  if (!gf) return "";
+  if (gf.conflicted) return "conflict";
+  if (gf.untracked) return "untracked";
+  const staged = gf.staged !== " " && gf.staged !== "";
+  const worktree = gf.worktree !== " " && gf.worktree !== "";
+  if (staged && !worktree) return "staged";
+  return "modified";
 }
 
 // 刷新文件树着色（不改结构，只改类名/角标）。
@@ -312,10 +344,10 @@ function refreshGitDecorations() {
     if (!rel) return;
     const isDir = row.dataset.isDir === "1";
     const gf = isDir ? null : map.get(rel);
-    const code = isDir ? "" : gitDecor(gf);
+    const code = isDir ? "" : gitCode(gf);
     const existing = row.querySelector(".git-badge");
     if (code) {
-      row.dataset.gitStatus = gf.conflicted ? "conflict" : gf.untracked ? "untracked" : gf.staged !== " " && gf.worktree === " " ? "staged" : "modified";
+      row.dataset.gitStatus = gitStatusClass(gf);
       if (existing) existing.textContent = code;
       else {
         const b = document.createElement("span");
@@ -337,10 +369,10 @@ function refreshTabDecorations() {
   els.tabs.querySelectorAll(".tab").forEach((tab) => {
     const rel = tab.dataset.rel;
     const gf = rel ? map.get(rel) : null;
-    const code = gitDecor(gf);
+    const code = gitCode(gf);
     let badge = tab.querySelector(".tab-git");
     if (code) {
-      tab.dataset.gitStatus = gf.conflicted ? "conflict" : gf.untracked ? "untracked" : "modified";
+      tab.dataset.gitStatus = gitStatusClass(gf);
       if (!badge) {
         badge = document.createElement("span");
         badge.className = "tab-git";
@@ -356,11 +388,10 @@ function refreshTabDecorations() {
 
 function scmGroupLabel(gf) {
   if (gf.conflicted) return "冲突";
-  if (gf.untracked) return "未跟踪";
+  if (gf.untracked) return "更改";
   const staged = gf.staged !== " " && gf.staged !== "";
   const worktree = gf.worktree !== " " && gf.worktree !== "";
   if (staged && !worktree) return "已暂存";
-  if (staged && worktree) return "已暂存 + 工作区";
   return "更改";
 }
 
@@ -376,6 +407,8 @@ async function refreshGit() {
     els.scmGroups.innerHTML = "";
     els.scmCommitWrap.classList.add("hidden");
     els.scmBranch.classList.add("hidden");
+    els.scmSync.classList.add("hidden");
+    els.scmToolbar.classList.add("hidden");
     refreshGitDecorations();
     refreshTabDecorations();
     return;
@@ -383,9 +416,20 @@ async function refreshGit() {
   els.scmEmpty.classList.add("hidden");
   els.scmCommitWrap.classList.remove("hidden");
   els.scmBranch.classList.remove("hidden");
-  const track = (st.ahead ? ` ↑${st.ahead}` : "") + (st.behind ? ` ↓${st.behind}` : "");
-  els.scmBranch.textContent = (st.branch || "(detached)") + track;
+  els.scmToolbar.classList.remove("hidden");
+  els.scmBranch.innerHTML = SVG_BRANCH + "<span>" + (st.branch || "(detached)") + "</span>";
   els.scmBranch.title = st.upstream ? `上游：${st.upstream}` : "无上游";
+
+  // 同步指示
+  if (st.ahead || st.behind) {
+    els.scmSync.classList.remove("hidden");
+    els.scmSync.innerHTML =
+      (st.behind ? `<span class="behind">↓${st.behind}</span>` : "") +
+      (st.ahead ? `<span class="ahead">↑${st.ahead}</span>` : "");
+    els.scmSync.title = `领先 ${st.ahead} / 落后 ${st.behind}`;
+  } else {
+    els.scmSync.classList.add("hidden");
+  }
 
   renderScmGroups();
   refreshGitDecorations();
@@ -402,34 +446,53 @@ function renderScmGroups() {
     wrap.append(e);
     return;
   }
-  // 按组聚合。
+  // 按组聚合：冲突 / 已暂存 / 更改。
+  const order = ["冲突", "已暂存", "更改"];
   const groups = new Map();
   for (const f of gitState.files) {
     const g = scmGroupLabel(f);
     if (!groups.has(g)) groups.set(g, []);
     groups.get(g).push(f);
   }
-  for (const [label, files] of groups) {
+  for (const label of order) {
+    const files = groups.get(label);
+    if (!files || !files.length) continue;
+    const collapsed = scmCollapsed.has(label);
     const h = document.createElement("div");
-    h.className = "scm-group-head";
-    h.textContent = `${label} (${files.length})`;
+    h.className = "scm-group-head" + (collapsed ? " collapsed" : "");
+    h.innerHTML = `<span class="chev">${SVG_CHEVRON}</span><span>${label}</span><span class="cnt">${files.length}</span>`;
+    h.addEventListener("click", () => {
+      if (scmCollapsed.has(label)) scmCollapsed.delete(label); else scmCollapsed.add(label);
+      renderScmGroups();
+    });
     wrap.append(h);
-    for (const f of files) wrap.append(scmRow(f));
+    if (!collapsed) for (const f of files) wrap.append(scmRow(f, label));
   }
 }
 
-function scmRow(f) {
+function scmRow(f, groupLabel) {
   const row = document.createElement("div");
   row.className = "scm-row";
   row.dataset.rel = f.rel;
 
+  // 文件类型图标
+  const icon = document.createElement("span");
+  icon.className = "scm-icon";
+  const ic = fileIcon(f.rel.split("/").pop());
+  icon.innerHTML = ic.svg;
+  icon.style.color = ic.color;
+  row.append(icon);
+
+  // 文件名
   const name = document.createElement("span");
   name.className = "scm-name";
   const slash = f.rel.lastIndexOf("/");
   name.textContent = slash >= 0 ? f.rel.slice(slash + 1) : f.rel;
   name.title = f.rel;
-  const dir = slash >= 0 ? f.rel.slice(0, slash) : "";
   row.append(name);
+
+  // 目录
+  const dir = slash >= 0 ? f.rel.slice(0, slash) : "";
   if (dir) {
     const d = document.createElement("span");
     d.className = "scm-dir";
@@ -437,22 +500,23 @@ function scmRow(f) {
     row.append(d);
   }
 
+  // hover 操作按钮
   const acts = document.createElement("span");
   acts.className = "scm-acts";
-  const staged = f.staged !== " " && f.staged !== "";
-  const mkBtn = (txt, title, fn) => {
+  const stagedGroup = groupLabel === "已暂存";
+  const mkBtn = (svg, title, fn) => {
     const b = document.createElement("button");
     b.className = "scm-act";
-    b.textContent = txt;
+    b.innerHTML = svg;
     b.title = title;
     b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
     return b;
   };
-  acts.append(mkBtn(staged ? "−" : "+", staged ? "取消暂存" : "暂存", async () => {
-    if (staged) await gitUnstage(projectId, f.rel); else await gitStage(projectId, f.rel);
+  acts.append(mkBtn(stagedGroup ? SVG_MINUS : SVG_PLUS, stagedGroup ? "取消暂存" : "暂存", async () => {
+    if (stagedGroup) await gitUnstage(projectId, f.rel); else await gitStage(projectId, f.rel);
     await refreshGit();
   }));
-  acts.append(mkBtn("↺", "丢弃更改", async () => {
+  acts.append(mkBtn(SVG_DISCARD, "丢弃更改", async () => {
     const ok = await showModal({ title: "丢弃更改", text: `确定丢弃「${f.rel}」的更改？此操作不可恢复。`, okText: "丢弃", danger: true });
     if (!ok) return;
     await gitDiscard(projectId, f.rel);
@@ -461,7 +525,14 @@ function scmRow(f) {
   }));
   row.append(acts);
 
-  row.addEventListener("click", () => openGitDiff(f.rel, staged));
+  // 状态字母徽章
+  const code = document.createElement("span");
+  code.className = "scm-code " + gitCode(f);
+  code.textContent = gitCode(f);
+  code.title = "暂存:" + (f.staged === " " ? "·" : f.staged) + "  工作区:" + (f.worktree === " " ? "·" : f.worktree);
+  row.append(code);
+
+  row.addEventListener("click", () => openGitDiff(f.rel, stagedGroup));
   return row;
 }
 
@@ -540,6 +611,14 @@ function installScm() {
   els.scmCommitBtn?.addEventListener("click", doCommit);
   els.scmPullBtn?.addEventListener("click", doPull);
   els.scmPushBtn?.addEventListener("click", doPush);
+  els.scmStageAll?.addEventListener("click", async () => {
+    try { await gitStage(projectId, null); await refreshGit(); }
+    catch (e) { els.statusPath.textContent = "暂存失败：" + e; }
+  });
+  els.scmUnstageAll?.addEventListener("click", async () => {
+    try { await gitUnstage(projectId, null); await refreshGit(); }
+    catch (e) { els.statusPath.textContent = "取消暂存失败：" + e; }
+  });
   els.scmMessage?.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doCommit(); }
   });
