@@ -534,6 +534,317 @@ pub async fn ide_git_reset(
     Ok(format!("{}{}", out, err))
 }
 
+/// 从远程抓取（不合并）。
+#[tauri::command]
+pub async fn ide_git_fetch(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = project_root(&state, &project_id).await?;
+    let (ok, out, err) = run_git(&root, &["fetch", "--all", "--prune"])?;
+    if !ok {
+        return Err(format!("git fetch 失败：{}", err.trim()));
+    }
+    Ok(format!("{}{}", out, err))
+}
+
+/// 初始化仓库。
+#[tauri::command]
+pub async fn ide_git_init(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = project_root(&state, &project_id).await?;
+    if is_repo(&root) {
+        return Ok("已是 git 仓库".into());
+    }
+    let (ok, out, err) = run_git(&root, &["init"])?;
+    if !ok {
+        return Err(format!("git init 失败：{}", err.trim()));
+    }
+    Ok(format!("{}{}", out, err))
+}
+
+/// 克隆仓库到工作目录（要求目录为空）。
+#[tauri::command]
+pub async fn ide_git_clone(
+    project_id: String,
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("仓库地址不能为空".into());
+    }
+    let root = project_root(&state, &project_id).await?;
+    if is_repo(&root) {
+        return Err("当前目录已是 git 仓库".into());
+    }
+    let empty = std::fs::read_dir(&root)
+        .map_err(|e| format!("读取目录失败：{e}"))?
+        .next()
+        .is_none();
+    if !empty {
+        return Err("目录非空，无法克隆".into());
+    }
+    let parent = root.parent().ok_or_else(|| "无效的工作目录".to_string())?;
+    let name = root
+        .file_name()
+        .ok_or_else(|| "无效的工作目录".to_string())?
+        .to_string_lossy()
+        .to_string();
+    std::fs::remove_dir(&root).map_err(|e| format!("删除空目录失败：{e}"))?;
+    let (ok, out, err) = run_git(parent, &["clone", url, &name])?;
+    if !ok {
+        return Err(format!("git clone 失败：{}", err.trim()));
+    }
+    Ok(format!("{}{}", out, err))
+}
+
+/// 合并指定分支到当前分支。发生冲突时返回文本（含 CONFLICT）由前端提示。
+#[tauri::command]
+pub async fn ide_git_merge(
+    project_id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("分支名不能为空".into());
+    }
+    let root = project_root(&state, &project_id).await?;
+    let (ok, out, err) = run_git(&root, &["merge", "--no-edit", name])?;
+    let text = format!("{}{}", out, err);
+    if !ok {
+        if text.contains("CONFLICT") || text.contains("Automatic merge failed") {
+            return Ok(text);
+        }
+        return Err(format!("git merge 失败：{}", err.trim()));
+    }
+    Ok(text)
+}
+
+/// 中止合并。
+#[tauri::command]
+pub async fn ide_git_merge_abort(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = project_root(&state, &project_id).await?;
+    let (ok, out, err) = run_git(&root, &["merge", "--abort"])?;
+    if !ok {
+        return Err(format!("git merge --abort 失败：{}", err.trim()));
+    }
+    Ok(format!("{}{}", out, err))
+}
+
+/// 冲突解决：按 `ours`/`theirs` 取一侧并暂存该文件。
+#[tauri::command]
+pub async fn ide_git_resolve(
+    project_id: String,
+    rel_path: String,
+    side: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let flag = match side.as_str() {
+        "ours" => "--ours",
+        "theirs" => "--theirs",
+        _ => return Err("side 只能是 ours 或 theirs".into()),
+    };
+    let root = project_root(&state, &project_id).await?;
+    let (ok, _, err) = run_git(&root, &["checkout", flag, "--", &rel_path])?;
+    if !ok {
+        return Err(format!("git checkout 冲突侧失败：{}", err.trim()));
+    }
+    let (ok, _, err) = run_git(&root, &["add", "--", &rel_path])?;
+    if !ok {
+        return Err(format!("git add 失败：{}", err.trim()));
+    }
+    Ok(())
+}
+
+/// 暂存当前改动（包含未跟踪文件）。
+#[tauri::command]
+pub async fn ide_git_stash_push(
+    project_id: String,
+    message: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = project_root(&state, &project_id).await?;
+    let msg = message.unwrap_or_default();
+    let args: Vec<&str> = if msg.trim().is_empty() {
+        vec!["stash", "push", "-u"]
+    } else {
+        vec!["stash", "push", "-u", "-m", msg.trim()]
+    };
+    let (ok, out, err) = run_git(&root, &args)?;
+    if !ok {
+        return Err(format!("git stash 失败：{}", err.trim()));
+    }
+    Ok(format!("{}{}", out, err))
+}
+
+/// 暂存列表条目。
+#[derive(Debug, Clone, Serialize)]
+pub struct GitStash {
+    pub index: u32,
+    pub name: String,
+    pub message: String,
+}
+
+/// 列出 stash。
+#[tauri::command]
+pub async fn ide_git_stash_list(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<GitStash>, String> {
+    let root = project_root(&state, &project_id).await?;
+    if !is_repo(&root) {
+        return Ok(Vec::new());
+    }
+    let (ok, out, err) = run_git(&root, &["stash", "list", "--format=%gd\u{1f}%s\u{1e}"])?;
+    if !ok {
+        return Err(format!("git stash list 失败：{}", err.trim()));
+    }
+    let mut list = Vec::new();
+    for (i, rec) in out.split('\u{1e}').enumerate() {
+        let rec = rec.trim_matches(['\n', '\r']);
+        if rec.is_empty() {
+            continue;
+        }
+        let mut parts = rec.splitn(2, '\u{1f}');
+        let name = parts.next().unwrap_or("").trim().to_string();
+        let message = parts.next().unwrap_or("").to_string();
+        list.push(GitStash {
+            index: i as u32,
+            name,
+            message,
+        });
+    }
+    Ok(list)
+}
+
+/// 弹出/应用/删除 stash。`action` 取 pop|apply|drop。
+#[tauri::command]
+pub async fn ide_git_stash_op(
+    project_id: String,
+    action: String,
+    index: u32,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let act = match action.as_str() {
+        "pop" | "apply" | "drop" => action.as_str(),
+        _ => return Err("action 只能是 pop/apply/drop".into()),
+    };
+    let root = project_root(&state, &project_id).await?;
+    let spec = format!("stash@{{{index}}}");
+    let (ok, out, err) = run_git(&root, &["stash", act, &spec])?;
+    if !ok {
+        return Err(format!("git stash {act} 失败：{}", err.trim()));
+    }
+    Ok(format!("{}{}", out, err))
+}
+
+/// 单文件提交历史。
+#[tauri::command]
+pub async fn ide_git_file_log(
+    project_id: String,
+    rel_path: String,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<GitCommit>, String> {
+    let root = project_root(&state, &project_id).await?;
+    if !is_repo(&root) {
+        return Ok(Vec::new());
+    }
+    let n = limit.unwrap_or(100).to_string();
+    let (ok, out, err) = run_git(
+        &root,
+        &[
+            "log",
+            &format!("-n{n}"),
+            "--pretty=format:%H\u{1f}%h\u{1f}%s\u{1f}%an\u{1f}%ad\u{1e}",
+            "--date=format:%Y-%m-%d %H:%M",
+            "--",
+            &rel_path,
+        ],
+    )?;
+    if !ok {
+        return Err(format!("读取文件历史失败：{}", err.trim()));
+    }
+    Ok(parse_log(&out))
+}
+
+/// blame 单行。
+#[derive(Debug, Clone, Serialize)]
+pub struct GitBlameLine {
+    pub hash: String,
+    pub short: String,
+    pub author: String,
+    pub time: String,
+    pub line: u32,
+    pub text: String,
+}
+
+/// 逐行 blame。
+#[tauri::command]
+pub async fn ide_git_blame(
+    project_id: String,
+    rel_path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<GitBlameLine>, String> {
+    let root = project_root(&state, &project_id).await?;
+    if !is_repo(&root) {
+        return Ok(Vec::new());
+    }
+    let (ok, out, err) = run_git(
+        &root,
+        &["blame", "--line-porcelain", "--date=format:%Y-%m-%d %H:%M", "--", &rel_path],
+    )?;
+    if !ok {
+        return Err(format!("git blame 失败：{}", err.trim()));
+    }
+    Ok(parse_blame(&out))
+}
+
+/// 解析 `git blame --line-porcelain` 输出。
+fn parse_blame(raw: &str) -> Vec<GitBlameLine> {
+    let mut lines = Vec::new();
+    let mut hash = String::new();
+    let mut author = String::new();
+    let mut time = String::new();
+    let mut lineno = 0u32;
+    for line in raw.split('\n') {
+        if let Some(rest) = line.strip_prefix("author ") {
+            author = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("author-time ") {
+            time = rest.to_string();
+        } else if let Some(text) = line.strip_prefix('\t') {
+            lines.push(GitBlameLine {
+                hash: hash.clone(),
+                short: hash.chars().take(8).collect(),
+                author: author.clone(),
+                time: time.clone(),
+                line: lineno,
+                text: text.to_string(),
+            });
+        } else {
+            let mut it = line.split_whitespace();
+            if let Some(sha) = it.next() {
+                if sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                    hash = sha.to_string();
+                    author.clear();
+                    time.clear();
+                    if let Some(l) = it.nth(1) {
+                        lineno = l.parse().unwrap_or(0);
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_log, parse_status};
@@ -594,5 +905,16 @@ mod tests {
         assert_eq!(commits[0].author, "alice");
         assert_eq!(commits[1].hash, "bbb");
         assert_eq!(commits[1].subject, "second");
+    }
+
+    #[test]
+    fn parses_blame_porcelain_line_numbers() {
+        let raw = "0123456789abcdef0123456789abcdef01234567 1 1 1\nauthor Alice\nauthor-time 1700000000\n\tfirst line\n89abcdef0123456789abcdef0123456789abcdef 2 2 1\nauthor Bob\nauthor-time 1700000001\n\tsecond line\n";
+        let blame = super::parse_blame(raw);
+        assert_eq!(blame.len(), 2);
+        assert_eq!(blame[0].line, 1);
+        assert_eq!(blame[0].text, "first line");
+        assert_eq!(blame[1].line, 2);
+        assert_eq!(blame[1].text, "second line");
     }
 }

@@ -229,6 +229,28 @@ html, body {
 .scm-empty, .scm-clean { padding: 10px 14px; color: var(--fg-faint); font-size: 12px; }
 .scm-groups { flex: 1; }
 
+.hist-file-bar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 8px; border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; background: var(--bg-elev);
+  z-index: 2;
+}
+.hist-file-back {
+  border: none; background: transparent; color: var(--fg);
+  cursor: pointer; font-size: 12px;
+}
+.hist-file-label {
+  font-size: 12px; opacity: .8; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+
+.blame-glyph {
+  background: #3a3d41;
+  width: 4px !important;
+  margin-left: 4px;
+  border-radius: 2px;
+}
+
 /* 分组头（可折叠） */
 .scm-group-head {
   display: flex; align-items: center; gap: 4px;
@@ -321,11 +343,24 @@ html, body {
 /* 提交历史 */
 .scm-history { flex: 1; }
 .hist-row {
-  padding: 5px 12px; cursor: pointer; border-radius: 6px; margin: 0 6px;
+  position: relative; padding: 5px 56px 5px 12px; cursor: pointer; border-radius: 6px; margin: 0 6px;
 }
 .hist-row:hover { background: var(--tree-hover); }
 .hist-subj { font-size: 13px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hist-meta { font-size: 11px; color: var(--fg-faint); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hist-reset { position: absolute; right: 8px; top: 10px; border: 1px solid var(--border); background: var(--bg-elev2); color: var(--fg-dim); border-radius: 5px; padding: 2px 6px; cursor: pointer; font-size: 11px; opacity: 0; }
+.hist-row:hover .hist-reset { opacity: 1; }
+.hist-reset:hover { color: var(--fg); border-color: var(--accent); }
+.scm-load-more { display: block; width: calc(100% - 12px); margin: 8px 6px; border: 1px solid var(--border); background: transparent; color: var(--accent); border-radius: 6px; padding: 5px; cursor: pointer; font-size: 12px; }
+.scm-load-more:hover { background: var(--accent-soft); }
+.scm-init-btn { margin-top: 10px; width: auto; }
+.scm-conflict-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin: 4px 6px 8px; border: 1px solid rgba(241,76,76,.35); background: rgba(241,76,76,.1); border-radius: 7px; color: var(--git-D); font-size: 11px; }
+.scm-conflict-bar span { flex: 1; }
+.scm-btn.danger { color: var(--git-D); border-color: rgba(241,76,76,.4); flex: 0 0 auto; padding: 3px 6px; }
+.stash-row { display: flex; align-items: center; gap: 3px; padding: 4px 10px 4px 26px; }
+.stash-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--fg-dim); }
+.stash-act { opacity: .75; width: auto; padding: 1px 4px; font-size: 10px; }
+.stash-save { margin-top: 4px; }
 
 .scm-commit-wrap { padding: 8px 10px; border-top: 1px solid var(--border); }
 .scm-message {

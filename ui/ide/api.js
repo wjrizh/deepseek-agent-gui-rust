@@ -121,6 +121,50 @@ export function gitReset(projectId, hash, mode) {
   return invoke("ide_git_reset", { projectId, hash, mode });
 }
 
+export function gitInit(projectId) {
+  return invoke("ide_git_init", { projectId });
+}
+
+export function gitFetch(projectId) {
+  return invoke("ide_git_fetch", { projectId });
+}
+
+export function gitMergeAbort(projectId) {
+  return invoke("ide_git_merge_abort", { projectId });
+}
+
+export function gitResolve(projectId, relPath, side) {
+  return invoke("ide_git_resolve", { projectId, relPath, side });
+}
+
+export function gitStashPush(projectId, message) {
+  return invoke("ide_git_stash_push", { projectId, message: message || null });
+}
+
+export function gitStashList(projectId) {
+  return invoke("ide_git_stash_list", { projectId });
+}
+
+export function gitStashOp(projectId, action, index) {
+  return invoke("ide_git_stash_op", { projectId, action, index });
+}
+
+export function gitClone(projectId, url) {
+  return invoke("ide_git_clone", { projectId, url });
+}
+
+export function gitMerge(projectId, name) {
+  return invoke("ide_git_merge", { projectId, name });
+}
+
+export function gitFileLog(projectId, relPath, limit) {
+  return invoke("ide_git_file_log", { projectId, relPath, limit: limit || null });
+}
+
+export function gitBlame(projectId, relPath) {
+  return invoke("ide_git_blame", { projectId, relPath });
+}
+
 export function getRestrict(projectId) {
   return invoke("get_restrict", { projectId });
 }

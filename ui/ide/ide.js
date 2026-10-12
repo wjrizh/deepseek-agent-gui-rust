@@ -9,6 +9,8 @@ import {
   getWorkdir, setWorkdir, getRestrict, setRestrict,
   gitStatus, gitDiff, gitStage, gitUnstage, gitDiscard, gitCommit, gitPush, gitPull,
   gitBranches, gitBranchCreate, gitCheckout, gitBranchDelete, gitLog, gitShow, gitReset,
+  gitInit, gitFetch, gitClone, gitMerge, gitMergeAbort, gitResolve,
+  gitStashPush, gitStashList, gitStashOp, gitFileLog, gitBlame,
 } from "./api.js";
 
 // 剪贴板：仅记录一次复制/剪切操作的相对路径，粘贴时读取。
@@ -57,6 +59,8 @@ const els = {
   actBadge: document.getElementById("act-scm-badge"),
   scmBody: document.getElementById("scm-body"),
   scmEmpty: document.getElementById("scm-empty"),
+  scmInitBtn: document.getElementById("scm-init-btn"),
+  scmCloneBtn: document.getElementById("scm-clone-btn"),
   scmGroups: document.getElementById("scm-groups"),
   scmHistory: document.getElementById("scm-history"),
   scmTabChanges: document.getElementById("scm-tab-changes"),
@@ -430,6 +434,10 @@ function scmGroupLabel(gf) {
 
 // 当前页签：changes | history
 let scmTab = "changes";
+let historyLimit = 50;
+let historyFileRel = null;
+let historyCommits = [];
+let scmStashes = [];
 
 function switchScmTab(tab) {
   scmTab = tab;
@@ -493,6 +501,30 @@ async function openBranchMenu() {
       item.append(del);
     }
     if (!b.current) {
+      const merge = document.createElement("button");
+      merge.className = "branch-del";
+      merge.textContent = "合并";
+      merge.title = "合并到当前分支";
+      merge.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const ok = await showModal({ title: "合并分支", text: `将分支「${b.name}」合并到当前分支？`, okText: "合并" });
+        if (!ok) return;
+        try {
+          const text = await gitMerge(projectId, b.name);
+          if (text.includes("CONFLICT") || text.includes("Automatic merge failed")) {
+            await showModal({ title: "合并冲突", text: text || "发生冲突，请手动解决。", okText: "关闭" });
+            await refreshGit();
+            return;
+          }
+          els.statusPath.textContent = `已合并分支：${b.name}`;
+          closeBranchMenu();
+          await refreshGit();
+          await tree?.refresh();
+        } catch (err) {
+          els.statusPath.textContent = "合并失败：" + err;
+        }
+      });
+      item.append(merge);
       item.addEventListener("click", async () => {
         try { await gitCheckout(projectId, b.name); closeBranchMenu(); await refreshGit(); await tree?.refresh(); }
         catch (err) { els.statusPath.textContent = "切换失败：" + err; }
@@ -513,26 +545,69 @@ async function openBranchMenu() {
   });
   menu.append(newBtn);
 
+  const mergeNote = document.createElement("div");
+  mergeNote.className = "branch-new";
+  mergeNote.textContent = "↳ 合并到当前分支…";
+  mergeNote.style.marginTop = "8px";
+  mergeNote.addEventListener("click", async () => {
+    closeBranchMenu();
+    const target = branches.find((b) => !b.current);
+    if (!target) return;
+    const ok = await showModal({ title: "合并分支", text: `将分支「${target.name}」合并到当前分支？`, okText: "合并" });
+    if (!ok) return;
+    try {
+      const text = await gitMerge(projectId, target.name);
+      if (text.includes("CONFLICT") || text.includes("Automatic merge failed")) {
+        await showModal({ title: "合并冲突", text: text || "发生冲突，请手动解决。", okText: "关闭" });
+        await refreshGit();
+        return;
+      }
+      els.statusPath.textContent = `已合并分支：${target.name}`;
+      await refreshGit();
+      await tree?.refresh();
+    } catch (e) {
+      els.statusPath.textContent = "合并失败：" + e;
+    }
+  });
+  menu.append(mergeNote);
   document.body.append(menu);
   branchMenuEl = menu;
 
-  setTimeout(() => {
-    const onDoc = (e) => {
-      if (!menu.contains(e.target) && e.target !== els.scmBranch) {
-        closeBranchMenu();
-        document.removeEventListener("mousedown", onDoc);
-      }
-    };
-    document.addEventListener("mousedown", onDoc);
-  }, 0);
+  const onDoc = (e) => {
+    if (!menu.contains(e.target) && !els.scmBranch.contains(e.target)) {
+      closeBranchMenu();
+      document.removeEventListener("mousedown", onDoc);
+    }
+  };
+  document.addEventListener("mousedown", onDoc);
 }
 
 async function renderHistory() {
   const wrap = els.scmHistory;
   wrap.innerHTML = "";
   let commits = [];
-  try { commits = await gitLog(projectId, 100); }
-  catch (e) { wrap.textContent = "读取历史失败：" + e; return; }
+  try {
+    commits = historyFileRel
+      ? await gitFileLog(projectId, historyFileRel, historyLimit)
+      : await gitLog(projectId, historyLimit);
+    historyCommits = commits;
+  } catch (e) { wrap.textContent = "读取历史失败：" + e; return; }
+
+  if (historyFileRel) {
+    const bar = document.createElement("div");
+    bar.className = "hist-file-bar";
+    const back = document.createElement("button");
+    back.className = "hist-file-back";
+    back.textContent = "← 全部历史";
+    back.addEventListener("click", () => { historyFileRel = null; historyLimit = 100; renderHistory(); });
+    const label = document.createElement("span");
+    label.className = "hist-file-label";
+    label.textContent = historyFileRel;
+    label.title = historyFileRel;
+    bar.append(back, label);
+    wrap.append(bar);
+  }
+
   if (!commits.length) {
     const e = document.createElement("div");
     e.className = "scm-clean";
@@ -554,8 +629,35 @@ async function renderHistory() {
     meta.textContent = `${c.short} · ${c.author} · ${c.time}`;
     row.append(subj, meta);
     row.addEventListener("click", () => openCommitDiff(c));
+
+    const reset = document.createElement("button");
+    reset.className = "hist-reset";
+    reset.textContent = "还原";
+    reset.title = "还原到此提交（混合模式）";
+    reset.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const ok = await showModal({ title: "还原提交", text: `将当前分支还原到「${c.short}」？`, okText: "还原", danger: true });
+      if (!ok) return;
+      try { await gitReset(projectId, c.hash, "mixed"); els.statusPath.textContent = "已还原到 " + c.short; await refreshGit(); await tree?.refresh(); }
+      catch (err) { els.statusPath.textContent = "还原失败：" + err; }
+    });
+    row.append(reset);
     wrap.append(row);
   }
+  if (commits.length >= historyLimit) {
+    const more = document.createElement("button");
+    more.className = "scm-load-more";
+    more.textContent = "加载更多";
+    more.addEventListener("click", async () => { historyLimit += 50; await renderHistory(); });
+    wrap.append(more);
+  }
+}
+
+async function showFileHistory(rel) {
+  historyFileRel = rel;
+  historyLimit = 100;
+  switchScmTab("history");
+  await renderHistory();
 }
 
 // 查看某提交的 diff（整个提交）。
@@ -574,17 +676,21 @@ async function refreshGit() {
 
   if (!st.is_repo) {
     els.scmEmpty.classList.remove("hidden");
-    els.scmEmpty.textContent = "未检测到 Git 仓库";
+    if (els.scmEmpty.firstChild) els.scmEmpty.firstChild.nodeValue = "未检测到 Git 仓库";
     els.scmGroups.innerHTML = "";
     els.scmCommitWrap.classList.add("hidden");
     els.scmBranch.classList.add("hidden");
     els.scmSync.classList.add("hidden");
     els.scmToolbar.classList.add("hidden");
+    els.scmInitBtn?.classList.remove("hidden");
+    els.scmCloneBtn?.classList.remove("hidden");
     refreshGitDecorations();
     refreshTabDecorations();
     return;
   }
   els.scmEmpty.classList.add("hidden");
+  els.scmInitBtn?.classList.add("hidden");
+  els.scmCloneBtn?.classList.add("hidden");
   els.scmCommitWrap.classList.remove("hidden");
   els.scmBranch.classList.remove("hidden");
   els.scmToolbar.classList.remove("hidden");
@@ -602,6 +708,7 @@ async function refreshGit() {
     els.scmSync.classList.add("hidden");
   }
 
+  await loadStashes();
   switchScmTab(scmTab);
   refreshGitDecorations();
   refreshTabDecorations();
@@ -616,7 +723,19 @@ function renderScmGroups() {
     e.className = "scm-clean";
     e.textContent = "没有更改";
     wrap.append(e);
+    renderStashGroup(wrap);
     return;
+  }
+  const conflicts = gitState.files.filter((f) => f.conflicted);
+  if (conflicts.length) {
+    const bar = document.createElement("div"); bar.className = "scm-conflict-bar";
+    const text = document.createElement("span"); text.textContent = `检测到 ${conflicts.length} 个冲突，请选择我方/对方版本`;
+    const abort = document.createElement("button"); abort.className = "scm-btn danger"; abort.textContent = "中止合并";
+    abort.addEventListener("click", async () => {
+      try { await gitMergeAbort(projectId); els.statusPath.textContent = "已中止合并"; await refreshGit(); }
+      catch (e) { els.statusPath.textContent = "中止合并失败：" + e; }
+    });
+    bar.append(text, abort); wrap.append(bar);
   }
   // 按组聚合：冲突 / 已暂存 / 更改。
   const order = ["冲突", "已暂存", "更改"];
@@ -640,6 +759,48 @@ function renderScmGroups() {
     wrap.append(h);
     if (!collapsed) for (const f of files) wrap.append(scmRow(f, label));
   }
+  renderStashGroup(wrap);
+}
+
+async function loadStashes() {
+  try { scmStashes = await gitStashList(projectId); }
+  catch (e) { scmStashes = []; }
+}
+
+function renderStashGroup(wrap) {
+  const head = document.createElement("div");
+  head.className = "scm-group-head stash-head";
+  head.innerHTML = `<span class="chev">${SVG_CHEVRON}</span><span>Stash</span><span class="cnt">${scmStashes.length}</span>`;
+  head.addEventListener("click", () => {
+    head.classList.toggle("collapsed");
+    body.classList.toggle("hidden", head.classList.contains("collapsed"));
+  });
+  wrap.append(head);
+  const body = document.createElement("div");
+  body.className = "stash-items";
+  for (const s of scmStashes) {
+    const row = document.createElement("div"); row.className = "stash-row";
+    const label = document.createElement("span"); label.className = "stash-label";
+    label.textContent = s.message || s.name; label.title = s.name;
+    row.append(label);
+    for (const [action, text] of [["apply", "应用"], ["pop", "弹出"], ["drop", "删除"]]) {
+      const b = document.createElement("button"); b.className = "scm-act stash-act"; b.textContent = text;
+      b.addEventListener("click", async () => {
+        if (action === "drop" && !(await showModal({ title: "删除 Stash", text: `删除「${s.message || s.name}」？`, okText: "删除", danger: true }))) return;
+        try { await gitStashOp(projectId, action, s.index); await loadStashes(); await refreshGit(); }
+        catch (e) { els.statusPath.textContent = "Stash 操作失败：" + e; }
+      }); row.append(b);
+    }
+    body.append(row);
+  }
+  const save = document.createElement("button"); save.className = "scm-load-more stash-save"; save.textContent = "保存当前更改到 Stash";
+  save.addEventListener("click", async () => {
+    const msg = await showModal({ title: "保存 Stash", input: true, text: "可选的说明", okText: "保存" });
+    if (msg === false) return;
+    try { await gitStashPush(projectId, msg || null); await loadStashes(); await refreshGit(); }
+    catch (e) { els.statusPath.textContent = "Stash 保存失败：" + e; }
+  });
+  body.append(save); wrap.append(body);
 }
 
 function scmRow(f, groupLabel) {
@@ -695,6 +856,14 @@ function scmRow(f, groupLabel) {
     await refreshGit();
     if (gitDiffActive && gitDiffKey && gitDiffKey.startsWith(f.rel + "|")) closeGitDiff();
   }));
+  if (f.conflicted) {
+    for (const [side, title] of [["ours", "我方"], ["theirs", "对方"]]) {
+      acts.append(mkBtn(side === "ours" ? "我" : "他", title, async () => {
+        try { await gitResolve(projectId, f.rel, side); await refreshGit(); }
+        catch (e) { els.statusPath.textContent = "冲突解决失败：" + e; }
+      }));
+    }
+  }
   row.append(acts);
 
   // 状态字母徽章
@@ -823,6 +992,22 @@ function installScm() {
     b.addEventListener("click", () => switchView(b.dataset.view));
   });
   els.scmRefreshBtn?.addEventListener("click", refreshGit);
+  els.scmInitBtn?.addEventListener("click", async () => {
+    try { await gitInit(projectId); els.statusPath.textContent = "Git 仓库已初始化"; await refreshGit(); await tree?.refresh(); }
+    catch (e) { els.statusPath.textContent = "初始化失败：" + e; }
+  });
+  els.scmCloneBtn?.addEventListener("click", async () => {
+    const url = await showModal({ title: "克隆仓库", input: true, text: "输入 Git 仓库地址（例如 https://github.com/xxx/yyy.git）", okText: "克隆", defaultValue: "" });
+    if (!url) return;
+    try {
+      await gitClone(projectId, url);
+      els.statusPath.textContent = "Git 仓库已克隆";
+      await refreshGit();
+      await tree?.refresh();
+    } catch (e) {
+      els.statusPath.textContent = "克隆失败：" + e;
+    }
+  });
   els.scmTabChanges?.addEventListener("click", () => switchScmTab("changes"));
   els.scmTabHistory?.addEventListener("click", () => switchScmTab("history"));
   els.scmBranch?.addEventListener("click", openBranchMenu);
@@ -984,6 +1169,7 @@ function activateTab(rel) {
   const doc = openDocs.get(rel);
   if (!doc) return;
   activeRel = rel;
+  if (blameOn && blameRel !== rel) clearBlame();
   els.statusPath.textContent = rel;
   els.breadcrumb.textContent = rel;
 
@@ -1197,6 +1383,8 @@ function showContextMenu(entry, x, y) {
   } else {
     m.append(
       menuItem("打开", () => openFile(entry.rel, entry.name)),
+      menuItem("文件历史", () => showFileHistory(entry.rel)),
+      menuItem("查看 Blame", () => showBlame(entry.rel)),
     );
   }
   m.append(sep());
@@ -1220,6 +1408,68 @@ function showContextMenu(entry, x, y) {
   const py = Math.min(y, window.innerHeight - r.height - pad);
   m.style.left = px + "px";
   m.style.top = py + "px";
+}
+
+// —— Blame ——
+let blameOn = false;
+let blameRel = null;
+let blameCollection = null;
+let blameLines = [];
+
+async function showBlame(rel) {
+  await openFile(rel, rel.split("/").pop());
+  if (!isTextDoc(rel)) { els.statusPath.textContent = "该文件不支持 Blame"; return; }
+  if (!editor) return;
+  let data = [];
+  try { data = await gitBlame(projectId, rel); }
+  catch (e) { els.statusPath.textContent = "Blame 失败：" + e; return; }
+  if (!data.length) { els.statusPath.textContent = "无 Blame 信息（未跟踪或未提交）"; return; }
+  blameLines = data;
+  blameRel = rel;
+  blameOn = true;
+  applyBlameDecorations();
+  els.statusPath.textContent = "Blame：" + rel;
+}
+
+function clearBlame() {
+  blameOn = false;
+  blameRel = null;
+  blameLines = [];
+  if (blameCollection) { blameCollection.clear(); blameCollection = null; }
+  if (editor) editor.updateOptions({ glyphMargin: false });
+}
+
+function applyBlameDecorations() {
+  if (!editor || !blameOn || !monaco) return;
+  editor.updateOptions({ glyphMargin: true });
+  if (blameCollection) blameCollection.clear();
+  const decorations = blameLines.map((b) => ({
+    range: new monaco.Range(b.line, 1, b.line, 1),
+    options: {
+      isWholeLine: true,
+      glyphMarginClassName: "blame-glyph",
+      glyphMarginHoverMessage: { value: `**${b.author}**  ${blameTime(b.time)}\n\n\`${b.short}\`` },
+    },
+  }));
+  if (editor.createDecorationsCollection) {
+    blameCollection = editor.createDecorationsCollection(decorations);
+  } else if (editor.deltaDecorations) {
+    const prev = editor.deltaDecorations([], decorations);
+    blameCollection = { clear: () => editor.deltaDecorations(prev, []) };
+  }
+}
+
+function blameTime(v) {
+  const n = Number(v);
+  if (!n) return v || "";
+  const d = new Date(n * 1000);
+  const p = (x) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function isTextDoc(rel) {
+  const doc = openDocs.get(rel);
+  return !!doc && doc.kind === "text";
 }
 
 function sep() { const d = document.createElement("div"); d.className = "ctx-sep"; return d; }
