@@ -710,7 +710,12 @@ async function refreshGit() {
   }
 
   await loadStashes();
-  switchScmTab(scmTab);
+  if (scmTab === "changes") {
+    renderScmGroups();
+    els.scmToolbar.classList.remove("hidden");
+  } else {
+    els.scmToolbar.classList.add("hidden");
+  }
   refreshGitDecorations();
   refreshTabDecorations();
   updateActBadge();
