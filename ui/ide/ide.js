@@ -656,8 +656,9 @@ async function renderHistory() {
 async function showFileHistory(rel) {
   historyFileRel = rel;
   historyLimit = 100;
+  scmTab = "history";
+  switchView("scm");
   switchScmTab("history");
-  await renderHistory();
 }
 
 // 查看某提交的 diff（整个提交）。
