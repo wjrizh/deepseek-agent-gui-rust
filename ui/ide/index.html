@@ -34,21 +34,48 @@
   </header>
 
   <div class="layout">
-    <!-- 左侧：文件树 -->
+    <!-- 左侧：文件树 + 源代码管理 -->
     <aside id="sidebar" class="sidebar">
-      <div class="sidebar-head">
-        <span class="sidebar-title">资源管理器</span>
-        <div class="sidebar-actions">
-          <button id="up-btn" class="icon-btn" title="上一层">↑</button>
-          <button id="refresh-btn" class="icon-btn" title="刷新">⟳</button>
+      <div class="sidebar-pane explorer-pane">
+        <div class="sidebar-head">
+          <span class="sidebar-title">资源管理器</span>
+          <div class="sidebar-actions">
+            <button id="up-btn" class="icon-btn" title="上一层">↑</button>
+            <button id="refresh-btn" class="icon-btn" title="刷新">⟳</button>
+          </div>
+        </div>
+        <div id="sidebar-path" class="sidebar-path" title="当前文件夹">/</div>
+        <div class="search-wrap">
+          <input id="file-search" class="file-search" type="text" placeholder="搜索文件…" />
+        </div>
+        <div id="file-tree" class="file-tree"></div>
+      </div>
+
+      <div class="sidebar-pane scm-pane" id="scm-pane">
+        <div class="sidebar-head scm-head">
+          <span class="sidebar-title">源代码管理</span>
+          <div class="sidebar-actions">
+            <span id="scm-branch" class="scm-branch hidden"></span>
+            <button id="scm-refresh-btn" class="icon-btn" title="刷新">⟳</button>
+          </div>
+        </div>
+        <div id="scm-body" class="scm-body">
+          <div id="scm-empty" class="scm-empty">未检测到 Git 仓库</div>
+          <div id="scm-groups" class="scm-groups"></div>
+          <div id="scm-commit-wrap" class="scm-commit-wrap hidden">
+            <textarea id="scm-message" class="scm-message" rows="2" placeholder="提交信息（Ctrl+Enter 提交）"></textarea>
+            <div class="scm-commit-actions">
+              <button id="scm-commit-btn" class="scm-btn primary" title="提交已暂存更改">提交</button>
+              <button id="scm-pull-btn" class="scm-btn" title="从远程拉取">拉取</button>
+              <button id="scm-push-btn" class="scm-btn" title="推送到远程">推送</button>
+            </div>
+          </div>
         </div>
       </div>
-      <div id="sidebar-path" class="sidebar-path" title="当前文件夹">/</div>
-      <div class="search-wrap">
-        <input id="file-search" class="file-search" type="text" placeholder="搜索文件…" />
-      </div>
-      <div id="file-tree" class="file-tree"></div>
     </aside>
+
+    <!-- 拖拽分隔条 -->
+    <div id="splitter" class="splitter"></div>
 
     <!-- 拖拽分隔条 -->
     <div id="splitter" class="splitter"></div>
@@ -69,6 +96,11 @@
           <span id="agent-diff-title">Agent 改动</span>
           <button id="btn-diff-mode" type="button">并排/内联</button>
           <button id="btn-close-diff" type="button">返回编辑</button>
+        </div>
+        <div id="git-diff-banner" class="agent-diff-banner git-diff-banner hidden">
+          <span id="git-diff-title">更改</span>
+          <button id="btn-git-diff-mode" type="button">并排/内联</button>
+          <button id="btn-close-git-diff" type="button">返回编辑</button>
         </div>
         <div id="diff-host" class="diff-host hidden"></div>
       </div>

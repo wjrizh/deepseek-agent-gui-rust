@@ -163,6 +163,85 @@ html, body {
 
 .sidebar-actions { display: flex; gap: 2px; }
 
+/* 侧边栏两个分区：资源管理器 + 源代码管理 */
+.sidebar-pane { display: flex; flex-direction: column; min-height: 0; }
+.explorer-pane { flex: 1 1 50%; }
+.scm-pane { flex: 1 1 50%; border-top: 1px solid var(--border); }
+
+/* ---------- 源代码管理 ---------- */
+.scm-branch {
+  font-size: 11px; font-weight: 600; letter-spacing: 0;
+  text-transform: none; color: var(--accent);
+  background: var(--accent-soft); border-radius: 6px; padding: 1px 6px;
+  max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.scm-body { flex: 1; overflow: auto; display: flex; flex-direction: column; padding-bottom: 6px; }
+.scm-empty, .scm-clean { padding: 10px 14px; color: var(--fg-faint); font-size: 12px; }
+.scm-groups { flex: 1; }
+.scm-group-head {
+  padding: 6px 14px 2px; color: var(--fg-dim);
+  font-size: 11px; font-weight: 700; letter-spacing: .04em;
+}
+.scm-row {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 10px 3px 14px; cursor: pointer; font-size: 13px;
+  border-radius: 6px; margin: 0 6px;
+}
+.scm-row:hover { background: var(--tree-hover); }
+.scm-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scm-dir {
+  flex: 1; min-width: 0; color: var(--fg-faint); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.scm-acts { display: flex; gap: 2px; opacity: 0; }
+.scm-row:hover .scm-acts { opacity: 1; }
+.scm-act {
+  border: none; background: transparent; color: var(--fg-dim);
+  cursor: pointer; font-size: 13px; border-radius: 5px; padding: 1px 5px;
+}
+.scm-act:hover { background: var(--accent-soft); color: var(--fg); }
+.scm-commit-wrap { padding: 8px 10px; border-top: 1px solid var(--border); }
+.scm-message {
+  width: 100%; resize: vertical; min-height: 44px;
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 8px; font-size: 12px; font-family: inherit;
+}
+.scm-message:focus { outline: none; border-color: var(--accent); }
+.scm-commit-actions { display: flex; gap: 6px; margin-top: 6px; }
+.scm-btn {
+  flex: 1; border: 1px solid var(--border); background: var(--bg-elev2);
+  color: var(--fg); cursor: pointer; border-radius: 8px; padding: 5px 0; font-size: 12px;
+}
+.scm-btn:hover { background: var(--tree-hover); }
+.scm-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.scm-btn.primary:hover { filter: brightness(1.1); }
+
+/* 文件树 Git 角标 */
+.git-badge {
+  flex-shrink: 0; font-size: 10px; font-weight: 700; font-family: monospace;
+  padding: 0 4px; border-radius: 4px; min-width: 14px; text-align: center;
+}
+.tree-row[data-git-status="modified"] .git-badge { color: #e2b341; }
+.tree-row[data-git-status="untracked"] .git-badge { color: #4fae6d; }
+.tree-row[data-git-status="staged"] .git-badge { color: #5b8cff; }
+.tree-row[data-git-status="conflict"] .git-badge { color: #ff6b6b; }
+
+/* 标签 Git 角标 */
+.tab-git {
+  font-size: 10px; font-weight: 700; font-family: monospace;
+  margin: 0 4px 0 2px; flex-shrink: 0;
+}
+.tab[data-git-status="modified"] .tab-git { color: #e2b341; }
+.tab[data-git-status="untracked"] .tab-git { color: #4fae6d; }
+.tab[data-git-status="staged"] .tab-git { color: #5b8cff; }
+.tab[data-git-status="conflict"] .tab-git { color: #ff6b6b; }
+.tab[data-git-status="modified"] .tab-name { color: #e2b341; }
+.tab[data-git-status="untracked"] .tab-name { color: #4fae6d; }
+.tab[data-git-status="conflict"] .tab-name { color: #ff6b6b; }
+
+/* Git diff banner 略作区分 */
+.git-diff-banner { background: rgba(226, 179, 65, 0.12); border-bottom-color: rgba(226, 179, 65, 0.4); }
+
 .search-wrap { padding: 0 10px 8px; }
 .file-search {
   width: 100%;

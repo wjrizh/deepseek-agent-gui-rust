@@ -7,6 +7,7 @@ import {
   readFile, writeFile, tauriWindow,
   deletePath, copyPath, movePath, createPath, restorePath, purgeTrash,
   getWorkdir, setWorkdir, getRestrict, setRestrict,
+  gitStatus, gitDiff, gitStage, gitUnstage, gitDiscard, gitCommit, gitPush, gitPull,
 } from "./api.js";
 
 // 剪贴板：仅记录一次复制/剪切操作的相对路径，粘贴时读取。
@@ -40,6 +41,20 @@ const els = {
   agentDiffTitle: document.getElementById("agent-diff-title"),
   btnDiffMode: document.getElementById("btn-diff-mode"),
   btnCloseDiff: document.getElementById("btn-close-diff"),
+  gitDiffBanner: document.getElementById("git-diff-banner"),
+  gitDiffTitle: document.getElementById("git-diff-title"),
+  btnGitDiffMode: document.getElementById("btn-git-diff-mode"),
+  btnCloseGitDiff: document.getElementById("btn-close-git-diff"),
+  scmBranch: document.getElementById("scm-branch"),
+  scmBody: document.getElementById("scm-body"),
+  scmEmpty: document.getElementById("scm-empty"),
+  scmGroups: document.getElementById("scm-groups"),
+  scmCommitWrap: document.getElementById("scm-commit-wrap"),
+  scmMessage: document.getElementById("scm-message"),
+  scmCommitBtn: document.getElementById("scm-commit-btn"),
+  scmPullBtn: document.getElementById("scm-pull-btn"),
+  scmPushBtn: document.getElementById("scm-push-btn"),
+  scmRefreshBtn: document.getElementById("scm-refresh-btn"),
 };
 
 let editor = null;       // Monaco editor 实例
@@ -93,6 +108,7 @@ function renderTabs() {
   for (const [rel, doc] of openDocs) {
     const tab = document.createElement("div");
     tab.className = "tab" + (rel === activeRel ? " active" : "");
+    tab.dataset.rel = rel;
     const name = document.createElement("span");
     name.className = "tab-name";
     name.textContent = rel.split("/").pop();
@@ -109,6 +125,7 @@ function renderTabs() {
     tab.addEventListener("click", () => activateTab(rel));
     els.tabs.appendChild(tab);
   }
+  refreshTabDecorations();
 }
 
 async function ensureEditor() {
@@ -143,10 +160,15 @@ function ensureDiffEditor() {
     fontFamily: "'JetBrainsMono Nerd Font', 'JetBrains Mono', 'Cascadia Code', Menlo, Consolas, monospace",
   });
   els.btnCloseDiff.onclick = closeAgentDiff;
-  els.btnDiffMode.onclick = () => {
-    const cur = diffEditor.getOption(monaco.editor.EditorOption.renderSideBySide);
-    diffEditor.updateOptions({ renderSideBySide: !cur });
-  };
+  els.btnDiffMode.onclick = () => toggleDiffMode();
+  els.btnGitDiffMode.onclick = () => toggleDiffMode();
+  els.btnCloseGitDiff.onclick = () => closeGitDiff();
+}
+
+function toggleDiffMode() {
+  if (!diffEditor || !monaco) return;
+  const cur = diffEditor.getOption(monaco.editor.EditorOption.renderSideBySide);
+  diffEditor.updateOptions({ renderSideBySide: !cur });
 }
 
 function openAgentDiff(rel) {
@@ -258,6 +280,296 @@ window.__hasUnreadAgentDiffUnder = (dirRel) => {
   return false;
 };
 window.__openAgentDiff = openAgentDiff;
+
+// —— 源代码管理（Git） ——
+let gitState = null;         // 最近一次 GitStatus
+let gitDiffActive = false;   // 当前是否展示 Git diff
+let gitDiffKey = null;       // 当前 diff 的 rel + staged 标识
+
+// rel -> { staged, worktree, untracked, conflicted }
+function gitFileMap() {
+  const m = new Map();
+  if (gitState && gitState.files) for (const f of gitState.files) m.set(f.rel, f);
+  return m;
+}
+
+// 从状态的 XY 码推断单字符展示态：M/A/D/R/U/?
+function gitDecor(gf) {
+  if (!gf) return "";
+  if (gf.conflicted) return "U";
+  if (gf.untracked) return "U";
+  const c = gf.worktree !== " " && gf.worktree !== "" ? gf.worktree : gf.staged;
+  return c && c !== " " ? c : "M";
+}
+
+// 刷新文件树着色（不改结构，只改类名/角标）。
+function refreshGitDecorations() {
+  const host = els.treeHost;
+  if (!host) return;
+  const map = gitFileMap();
+  host.querySelectorAll(".tree-row").forEach((row) => {
+    const rel = row.dataset.rel;
+    if (!rel) return;
+    const isDir = row.dataset.isDir === "1";
+    const gf = isDir ? null : map.get(rel);
+    const code = isDir ? "" : gitDecor(gf);
+    const existing = row.querySelector(".git-badge");
+    if (code) {
+      row.dataset.gitStatus = gf.conflicted ? "conflict" : gf.untracked ? "untracked" : gf.staged !== " " && gf.worktree === " " ? "staged" : "modified";
+      if (existing) existing.textContent = code;
+      else {
+        const b = document.createElement("span");
+        b.className = "git-badge";
+        b.textContent = code;
+        row.append(b);
+      }
+    } else {
+      delete row.dataset.gitStatus;
+      if (existing) existing.remove();
+    }
+  });
+}
+window.__refreshGitDecorations = refreshGitDecorations;
+
+// 标签着色。
+function refreshTabDecorations() {
+  const map = gitFileMap();
+  els.tabs.querySelectorAll(".tab").forEach((tab) => {
+    const rel = tab.dataset.rel;
+    const gf = rel ? map.get(rel) : null;
+    const code = gitDecor(gf);
+    let badge = tab.querySelector(".tab-git");
+    if (code) {
+      tab.dataset.gitStatus = gf.conflicted ? "conflict" : gf.untracked ? "untracked" : "modified";
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "tab-git";
+        tab.querySelector(".tab-close")?.before(badge);
+      }
+      badge.textContent = code;
+    } else {
+      delete tab.dataset.gitStatus;
+      badge?.remove();
+    }
+  });
+}
+
+function scmGroupLabel(gf) {
+  if (gf.conflicted) return "冲突";
+  if (gf.untracked) return "未跟踪";
+  const staged = gf.staged !== " " && gf.staged !== "";
+  const worktree = gf.worktree !== " " && gf.worktree !== "";
+  if (staged && !worktree) return "已暂存";
+  if (staged && worktree) return "已暂存 + 工作区";
+  return "更改";
+}
+
+async function refreshGit() {
+  let st;
+  try { st = await gitStatus(projectId); }
+  catch (e) { els.scmBody.textContent = "Git 状态获取失败：" + e; return; }
+  gitState = st;
+
+  if (!st.is_repo) {
+    els.scmEmpty.classList.remove("hidden");
+    els.scmEmpty.textContent = "未检测到 Git 仓库";
+    els.scmGroups.innerHTML = "";
+    els.scmCommitWrap.classList.add("hidden");
+    els.scmBranch.classList.add("hidden");
+    refreshGitDecorations();
+    refreshTabDecorations();
+    return;
+  }
+  els.scmEmpty.classList.add("hidden");
+  els.scmCommitWrap.classList.remove("hidden");
+  els.scmBranch.classList.remove("hidden");
+  const track = (st.ahead ? ` ↑${st.ahead}` : "") + (st.behind ? ` ↓${st.behind}` : "");
+  els.scmBranch.textContent = (st.branch || "(detached)") + track;
+  els.scmBranch.title = st.upstream ? `上游：${st.upstream}` : "无上游";
+
+  renderScmGroups();
+  refreshGitDecorations();
+  refreshTabDecorations();
+}
+
+function renderScmGroups() {
+  const wrap = els.scmGroups;
+  wrap.innerHTML = "";
+  if (!gitState || !gitState.files.length) {
+    const e = document.createElement("div");
+    e.className = "scm-clean";
+    e.textContent = "没有更改";
+    wrap.append(e);
+    return;
+  }
+  // 按组聚合。
+  const groups = new Map();
+  for (const f of gitState.files) {
+    const g = scmGroupLabel(f);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(f);
+  }
+  for (const [label, files] of groups) {
+    const h = document.createElement("div");
+    h.className = "scm-group-head";
+    h.textContent = `${label} (${files.length})`;
+    wrap.append(h);
+    for (const f of files) wrap.append(scmRow(f));
+  }
+}
+
+function scmRow(f) {
+  const row = document.createElement("div");
+  row.className = "scm-row";
+  row.dataset.rel = f.rel;
+
+  const name = document.createElement("span");
+  name.className = "scm-name";
+  const slash = f.rel.lastIndexOf("/");
+  name.textContent = slash >= 0 ? f.rel.slice(slash + 1) : f.rel;
+  name.title = f.rel;
+  const dir = slash >= 0 ? f.rel.slice(0, slash) : "";
+  row.append(name);
+  if (dir) {
+    const d = document.createElement("span");
+    d.className = "scm-dir";
+    d.textContent = dir;
+    row.append(d);
+  }
+
+  const acts = document.createElement("span");
+  acts.className = "scm-acts";
+  const staged = f.staged !== " " && f.staged !== "";
+  const mkBtn = (txt, title, fn) => {
+    const b = document.createElement("button");
+    b.className = "scm-act";
+    b.textContent = txt;
+    b.title = title;
+    b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+    return b;
+  };
+  acts.append(mkBtn(staged ? "−" : "+", staged ? "取消暂存" : "暂存", async () => {
+    if (staged) await gitUnstage(projectId, f.rel); else await gitStage(projectId, f.rel);
+    await refreshGit();
+  }));
+  acts.append(mkBtn("↺", "丢弃更改", async () => {
+    const ok = await showModal({ title: "丢弃更改", text: `确定丢弃「${f.rel}」的更改？此操作不可恢复。`, okText: "丢弃", danger: true });
+    if (!ok) return;
+    await gitDiscard(projectId, f.rel);
+    await refreshGit();
+    if (gitDiffActive && gitDiffKey && gitDiffKey.startsWith(f.rel + "|")) closeGitDiff();
+  }));
+  row.append(acts);
+
+  row.addEventListener("click", () => openGitDiff(f.rel, staged));
+  return row;
+}
+
+async function openGitDiff(rel, staged) {
+  let text;
+  try { text = await gitDiff(projectId, rel, staged); }
+  catch (e) { els.statusPath.textContent = "Diff 失败：" + e; return; }
+
+  await ensureEditor();
+  ensureDiffEditor();
+  if (!diffEditor || !monaco) return;
+  if (!gitDiffActive && !diffActive) diffViewState = editor ? editor.saveViewState() : null;
+
+  els.monacoHost.classList.add("hidden");
+  els.previewHost.classList.add("hidden");
+  els.diffHost.classList.remove("hidden");
+  els.gitDiffBanner.classList.remove("hidden");
+  els.agentDiffBanner.classList.add("hidden");
+
+  const lang = langForPath(rel);
+  const nonce = Date.now() + "_" + Math.random().toString(36).slice(2);
+  const oldUri = monaco.Uri.parse(`inmemory://git-diff/${nonce}/original/${rel}`);
+  const newUri = monaco.Uri.parse(`inmemory://git-diff/${nonce}/modified/${rel}`);
+  // 解析 unified diff：以 "+++ "/"--- " 后的内容为简单近似；失败则整段放修改侧。
+  const { original, modified } = splitUnifiedDiff(text, rel);
+  const oldModel = monaco.editor.createModel(original, lang, oldUri);
+  const newModel = monaco.editor.createModel(modified, lang, newUri);
+  const prev = diffEditor.getModel();
+  diffEditor.setModel({ original: oldModel, modified: newModel });
+  if (prev) { prev.original?.dispose(); prev.modified?.dispose(); }
+  diffEditor.layout();
+  gitDiffActive = true;
+  gitDiffKey = rel + "|" + (staged ? "staged" : "worktree");
+  els.gitDiffTitle.textContent = `${rel}（${staged ? "已暂存" : "工作区"}）`;
+  els.statusPath.textContent = rel + "（Git Diff）";
+}
+
+// 极简 unified diff 还原：无 diff 头时把文本当修改侧。
+function splitUnifiedDiff(text, rel) {
+  if (!text || text.indexOf("@@") === -1) return { original: "", modified: text || "" };
+  const oldLines = [];
+  const newLines = [];
+  for (const line of text.split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ") ||
+        line.startsWith("index ") || line.startsWith("new file") || line.startsWith("deleted file") ||
+        line.startsWith("similarity") || line.startsWith("rename ") || line.startsWith("old mode") ||
+        line.startsWith("new mode")) continue;
+    if (line.startsWith("@@")) continue;
+    if (line.startsWith("+")) newLines.push(line.slice(1));
+    else if (line.startsWith("-")) oldLines.push(line.slice(1));
+    else if (line.startsWith(" ")) { oldLines.push(line.slice(1)); newLines.push(line.slice(1)); }
+    else oldLines.push(line);
+  }
+  return { original: oldLines.join("\n"), modified: newLines.join("\n") };
+}
+
+function closeGitDiff() {
+  if (!gitDiffActive) return;
+  const m = diffEditor.getModel();
+  diffEditor.setModel(null);
+  if (m) { m.original?.dispose(); m.modified?.dispose(); }
+  els.diffHost.classList.add("hidden");
+  els.gitDiffBanner.classList.add("hidden");
+  const doc = activeRel ? openDocs.get(activeRel) : null;
+  const isPreview = doc && doc.kind === "preview";
+  els.previewHost.classList.toggle("hidden", !isPreview);
+  els.monacoHost.classList.toggle("hidden", isPreview);
+  if (editor && !isPreview && doc && doc.kind === "text") editor.setModel(doc.model);
+  gitDiffActive = false;
+  gitDiffKey = null;
+  if (editor) { editor.layout(); diffViewState = null; }
+}
+
+function installScm() {
+  els.scmRefreshBtn?.addEventListener("click", refreshGit);
+  els.scmCommitBtn?.addEventListener("click", doCommit);
+  els.scmPullBtn?.addEventListener("click", doPull);
+  els.scmPushBtn?.addEventListener("click", doPush);
+  els.scmMessage?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doCommit(); }
+  });
+}
+
+async function doCommit() {
+  const msg = (els.scmMessage.value || "").trim();
+  if (!msg) { els.statusPath.textContent = "请输入提交信息"; return; }
+  const hasStaged = gitState && gitState.files.some((f) => f.staged !== " " && f.staged !== "" && !f.untracked);
+  try {
+    if (!hasStaged && gitState && gitState.files.length) await gitStage(projectId, null);
+    await gitCommit(projectId, msg);
+    els.scmMessage.value = "";
+    els.statusPath.textContent = "已提交";
+    await refreshGit();
+    await tree?.refresh();
+  } catch (e) { els.statusPath.textContent = "提交失败：" + e; }
+}
+
+async function doPush() {
+  els.statusPath.textContent = "推送中…";
+  try { await gitPush(projectId); els.statusPath.textContent = "推送完成"; await refreshGit(); }
+  catch (e) { els.statusPath.textContent = "推送失败：" + e; }
+}
+
+async function doPull() {
+  els.statusPath.textContent = "拉取中…";
+  try { await gitPull(projectId); els.statusPath.textContent = "拉取完成"; await refreshGit(); await tree?.refresh(); }
+  catch (e) { els.statusPath.textContent = "拉取失败：" + e; }
+}
 
 // —— 应用级统一历史（文本 + 文件操作，按发生顺序） ——
 const history = [];
@@ -371,6 +683,7 @@ async function mountPreview(rel, name) {
 
 function activateTab(rel) {
   if (diffActive) closeAgentDiff(false);
+  if (gitDiffActive) closeGitDiff();
   const doc = openDocs.get(rel);
   if (!doc) return;
   activeRel = rel;
@@ -437,6 +750,7 @@ async function save() {
     renderTabs();
     els.statusPath.textContent = activeRel + "（已保存）";
     markAgentDiffCleared(activeRel);
+    if (gitState && gitState.is_repo) refreshGit().catch(() => {});
   } catch (e) {
     els.statusPath.textContent = "保存失败：" + e;
   }
@@ -855,8 +1169,10 @@ async function boot() {
   });
   window.addEventListener("mouseup", () => { dragging = false; document.body.style.userSelect = ""; });
 
+  installScm();
   installFsWatch();
   installAgentDiffWatch();
+  refreshGit();
 }
 
 function installAgentDiffWatch() {
@@ -953,6 +1269,10 @@ function installFsWatch() {
           setGlobalDirty();
           renderTabs();
         } catch {}
+      }
+
+      if ((changes.length || docsToSync.size) && gitState && gitState.is_repo) {
+        refreshGit().catch(() => {});
       }
     } finally {
       flushing = false;

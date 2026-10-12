@@ -60,6 +60,39 @@ export function openExternal(projectId, relPath) {
   return invoke("ide_open_external", { projectId, relPath });
 }
 
+// —— Git ——
+export function gitStatus(projectId) {
+  return invoke("ide_git_status", { projectId });
+}
+
+export function gitDiff(projectId, relPath, staged) {
+  return invoke("ide_git_diff", { projectId, relPath, staged: !!staged });
+}
+
+export function gitStage(projectId, relPath) {
+  return invoke("ide_git_stage", { projectId, relPath: relPath || null });
+}
+
+export function gitUnstage(projectId, relPath) {
+  return invoke("ide_git_unstage", { projectId, relPath: relPath || null });
+}
+
+export function gitDiscard(projectId, relPath) {
+  return invoke("ide_git_discard", { projectId, relPath });
+}
+
+export function gitCommit(projectId, message) {
+  return invoke("ide_git_commit", { projectId, message });
+}
+
+export function gitPush(projectId) {
+  return invoke("ide_git_push", { projectId });
+}
+
+export function gitPull(projectId) {
+  return invoke("ide_git_pull", { projectId });
+}
+
 export function getRestrict(projectId) {
   return invoke("get_restrict", { projectId });
 }

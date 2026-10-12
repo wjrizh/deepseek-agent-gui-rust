@@ -492,6 +492,7 @@ export function createTree(host, projectId, onOpenFile, restrict, opts = {}) {
       const dirty = isDir ? dirs.has(rel) : dirtyRelSet.has(rel);
       row.classList.toggle("dirty", dirty);
     });
+    if (window.__refreshGitDecorations) window.__refreshGitDecorations();
   }
   function setDirty(relSet) {
     dirtyRelSet = new Set(relSet);
