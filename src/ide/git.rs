@@ -455,7 +455,7 @@ pub async fn ide_git_log(
         &[
             "log",
             &format!("-n{n}"),
-            "--pretty=format:%H\x1f%h\x1f%s\x1f%an\x1f%ad",
+            "--pretty=format:%H\x1f%h\x1f%s\x1f%an\x1f%ad\x1e",
             "--date=format:%Y-%m-%d %H:%M",
         ],
     )?;
@@ -465,13 +465,18 @@ pub async fn ide_git_log(
         }
         return Err(format!("读取日志失败：{}", err.trim()));
     }
+    Ok(parse_log(&out))
+}
+
+/// 解析 `git log --pretty=format:%H\x1f%h\x1f%s\x1f%an\x1f%ad\x1e` 输出。
+fn parse_log(raw: &str) -> Vec<GitCommit> {
     let mut commits = Vec::new();
-    for line in out.split('\u{1e}') {
-        let line = line.trim_matches(['\n', '\r', '\u{1e}']);
-        if line.is_empty() {
+    for rec in raw.split('\u{1e}') {
+        let rec = rec.trim_matches(['\n', '\r']);
+        if rec.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.split('\u{1f}').collect();
+        let parts: Vec<&str> = rec.split('\u{1f}').collect();
         if parts.len() < 5 {
             continue;
         }
@@ -483,7 +488,7 @@ pub async fn ide_git_log(
             time: parts[4].to_string(),
         });
     }
-    Ok(commits)
+    commits
 }
 
 /// 查看某提交的 diff。
@@ -531,7 +536,7 @@ pub async fn ide_git_reset(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_status;
+    use super::{parse_log, parse_status};
 
     #[test]
     fn parses_modified_and_untracked() {
@@ -572,5 +577,22 @@ mod tests {
         assert_eq!(files[0].staged, "A");
         assert_eq!(files[0].worktree, " ");
         assert!(!files[0].untracked);
+    }
+
+    #[test]
+    fn parses_multiple_log_records() {
+        // 记录以 \x1e 分隔，字段以 \x1f 分隔。
+        let rec = "\u{1f}";
+        let raw = format!(
+            "aaa{0}aaaa{0}first{0}alice{0}2026-01-01 10:00\u{1e}bbb{0}bbbb{0}second{0}bob{0}2026-01-02 11:00\u{1e}",
+            rec
+        );
+        let commits = parse_log(&raw);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].hash, "aaa");
+        assert_eq!(commits[0].subject, "first");
+        assert_eq!(commits[0].author, "alice");
+        assert_eq!(commits[1].hash, "bbb");
+        assert_eq!(commits[1].subject, "second");
     }
 }

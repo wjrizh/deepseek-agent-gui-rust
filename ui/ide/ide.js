@@ -770,13 +770,15 @@ function splitUnifiedDiff(text, rel) {
   return { original: oldLines.join("\n"), modified: newLines.join("\n") };
 }
 
-// 从 Git diff 跳转到该文件：关闭 diff，打开文件，展开并选中文件树对应行。
+// 从 Git diff 跳转到该文件：若存在 Agent diff 则先进入 Agent diff，否则直接打开文件。
 async function gotoGitDiffFile() {
   const rel = gitDiffKey ? gitDiffKey.split("|")[0] : null;
   closeGitDiff();
   if (!rel) return;
   const name = rel.split("/").pop();
+  // 先登记为激活文档，保证关闭 Agent diff 后能回到该文件的编辑界面。
   await openFile(rel, name);
+  if (pendingAgentDiffs.has(rel)) openAgentDiff(rel);
   if (tree && tree.reveal) await tree.reveal(rel);
 }
 
