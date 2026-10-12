@@ -1199,6 +1199,22 @@ body {
 .compact-input::-webkit-outer-spin-button,
 .compact-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 
+.ide-btn {
+  flex-shrink: 0;
+  border: 0.5px solid var(--border);
+  background: var(--bg);
+  color: var(--fg2);
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: all .15s;
+}
+.ide-btn:hover { border-color: var(--accent); color: var(--accent); }
+
 /* ---------- Account / session management ---------- */
 .account-list, .session-list {
   display: flex;

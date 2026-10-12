@@ -10,6 +10,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 notify-rust = "4"
+notify-debouncer-mini = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
@@ -20,6 +21,8 @@ dirs = "7"
 anyhow = "1"
 tokio-tungstenite = "0.24"
 deepseek-agent = { path = "vendor/deepseek-agent" }
+base64 = "0.22"
+notify = "7.0.0"
 
 [lib]
 name = "deepseek_agent_gui_rust_lib"

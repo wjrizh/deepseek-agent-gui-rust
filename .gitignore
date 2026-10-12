@@ -18,3 +18,6 @@ node_modules
 # 系统文件
 .DS_Store
 *.log
+
+# IDE 回收站
+.ligong-ide-trash/

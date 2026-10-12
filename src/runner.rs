@@ -676,15 +676,9 @@ pub async fn run_turn(
                 return Ok(());
             }
             ParseOutcome::Calls(calls) => {
-                let flushed = answer_gate.lock().unwrap().finish_text();
-                if let Some(chunk) = flushed {
-                    if !chunk.trim().is_empty() {
-                        let _ = app.emit(
-                            "agent://delta",
-                            serde_json::json!({ "project_id": project_id, "kind": "answer", "text": chunk }),
-                        );
-                    }
-                }
+                // 含工具调用的回复：只反馈工具状态，不打印伴随的正文。
+                // 丢弃 gate 中缓冲的文本（工具标记之前的说明文字）。
+                answer_gate.lock().unwrap().finish_text();
                 let mut results = String::new();
                 let mut call_id: u64 = 0;
                 for call in calls {
@@ -798,6 +792,20 @@ async fn refresh_message_count(
     let _ = inner.projects.save();
     drop(inner);
     let _ = app.emit("agent://projects-changed", ());
+}
+
+fn resolve_tool_path(
+    params: &std::collections::HashMap<String, String>,
+    cwd: &std::path::Path,
+) -> Result<std::path::PathBuf, ()> {
+    let raw = params
+        .get("file_path")
+        .or_else(|| params.get("path"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or(())?;
+    let p = std::path::Path::new(raw);
+    Ok(if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) })
 }
 
 async fn execute_tool(
@@ -930,16 +938,51 @@ async fn execute_tool(
                 .call(&call.params, false, &mut on_output)
                 .await
                 .map_err(|e| e.to_string()),
-            "write_file" => crate::tools::WriteFile::new(cwd)
-                .with_restrict(restrict)
-                .call(&call.params, false, &mut on_output)
-                .await
-                .map_err(|e| e.to_string()),
-            "edit_file" => crate::tools::EditFile::new(cwd)
-                .with_restrict(restrict)
-                .call(&call.params, false, &mut on_output)
-                .await
-                .map_err(|e| e.to_string()),
+            "write_file" | "edit_file" => {
+                let target = resolve_tool_path(&call.params, &cwd);
+                let old = target.as_ref().ok()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .unwrap_or_default();
+                if let Ok(p) = &target {
+                    let mut inner = state.inner.lock().await;
+                    if let Some(w) = inner.ide_watcher.as_mut() {
+                        w.suppress_path(p);
+                    }
+                }
+                let is_write = call.name == "write_file";
+                let tool_out = if is_write {
+                    crate::tools::WriteFile::new(cwd.clone()).with_restrict(restrict)
+                        .call(&call.params, false, &mut on_output).await
+                } else {
+                    crate::tools::EditFile::new(cwd.clone()).with_restrict(restrict)
+                        .call(&call.params, false, &mut on_output).await
+                };
+                let out = tool_out.map_err(|e| e.to_string());
+                if out.is_ok() {
+                    if let Ok(p) = &target {
+                        let new = std::fs::read_to_string(p).unwrap_or_default();
+                        let rel = p.strip_prefix(&cwd)
+                            .map(|r| r.to_string_lossy().replace('\\', "/"))
+                            .unwrap_or_default();
+                        if !rel.is_empty() {
+                            let win_label = format!("ide-{project_id}");
+                            if let Some(win) = app.get_webview_window(&win_label) {
+                                let ts = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64).unwrap_or(0);
+                                let _ = win.emit("ide://agent-diff",
+                                    crate::ide::watch::AgentDiffPayload {
+                                        project_id: project_id.to_string(),
+                                        rel, old_content: old, new_content: new,
+                                        tool_call_id: call.raw.chars().take(40).collect(),
+                                        timestamp: ts,
+                                    });
+                            }
+                        }
+                    }
+                }
+                out
+            }
             _ => unreachable!(),
         };
     }

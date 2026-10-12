@@ -82,10 +82,7 @@ fn project_view(p: &Project, active: &Option<String>, working: bool) -> ProjectV
     }
 }
 
-#[tauri::command]
-pub fn log_frontend(msg: String) {
-    eprintln!("[FE] {}", msg);
-}
+
 
 #[tauri::command]
 pub async fn account_status() -> Result<AccountStatus, String> {
@@ -760,6 +757,7 @@ fn strip_extended_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
 
 #[tauri::command]
 pub async fn set_workdir(
+    app: AppHandle,
     project_id: String,
     path: String,
     state: State<'_, AppState>,
@@ -777,6 +775,12 @@ pub async fn set_workdir(
     if let Some(ctx) = inner.running.get_mut(&project_id) {
         ctx.session.announced_workdir = None;
     }
+    drop(inner);
+    // 广播给主窗口，使顶栏工作目录输入框实时跟随（IDE 里“上一层”也走这里）。
+    let _ = app.emit(
+        "agent://workdir-changed",
+        serde_json::json!({ "project_id": project_id, "path": dir }),
+    );
     Ok(dir)
 }
 

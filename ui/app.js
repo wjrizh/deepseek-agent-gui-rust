@@ -1,7 +1,6 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
-window.addEventListener("error", (e) => { try { invoke("log_frontend", { msg: "ERROR: " + (e.message||"") + " @ " + (e.filename||"") + ":" + (e.lineno||"") }); } catch(_) {} });
-window.addEventListener("unhandledrejection", (e) => { try { invoke("log_frontend", { msg: "REJECT: " + (e.reason && (e.reason.stack||e.reason.message||e.reason)) }); } catch(_) {} });
+
 
 const messagesEl = document.getElementById("messages");
 const inputEl = document.getElementById("input");
@@ -274,16 +273,11 @@ listen("agent://tool", (e) => {
   if (phase === "call") hideThinking(v);
   if (phase === "call") {
     flushRender(v);
+    // 本轮含工具调用：不打印任何伴随正文，直接移除已流式显示的文字。
     if (v.currentAssistant) {
-      v.currentAssistantText = v.currentAssistantText.replace(/<\s*(?:\|\s*)?(?:tool_calls|invoke)[\s\S]*$/i, "").trimEnd();
-      if (!v.currentAssistantText.trim()) {
-        v.currentAssistant.remove();
-        v.currentAssistant = null;
-        v.currentAssistantText = "";
-      } else {
-        detachCaret(v.currentAssistant);
-        v.currentAssistant.textContent = v.currentAssistantText;
-      }
+      v.currentAssistant.remove();
+      v.currentAssistant = null;
+      v.currentAssistantText = "";
     }
     v.currentTool = toolCard(v, name, command);
     v.currentTool.dataset.toolName = name || "tool";
@@ -492,6 +486,14 @@ if (compactInput) {
   compactInput.onchange = applyCompact;
   compactInput.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); compactInput.blur(); } };
   compactInput.onblur = applyCompact;
+}
+const ideBtn = document.getElementById("ide-btn");
+if (ideBtn) {
+  ideBtn.onclick = () => {
+    if (!activeProjectId) { iosToast("请先选择一个项目"); return; }
+    invoke("open_ide_window", { projectId: activeProjectId })
+      .catch((e) => iosToast("打开 IDE 失败：" + e));
+  };
 }
 
 const fileBtn = document.getElementById("file-btn");
@@ -1207,6 +1209,16 @@ settingsClearHistory.onclick = async () => {
 listen("agent://projects-changed", async () => {
   await renderProjects();
   if (settingsProjectId) await renderConversations();
+});
+
+// IDE 里切换工作目录（上一层 / 设为项目文件夹）后，主窗口顶栏实时跟随。
+listen("agent://workdir-changed", (e) => {
+  const { project_id, path } = e.payload || {};
+  if (!path) return;
+  if (project_id === activeProjectId) {
+    const el = document.getElementById("workdir-input");
+    if (el) el.value = path;
+  }
 });
 
 listen("agent://project-busy", (e) => {

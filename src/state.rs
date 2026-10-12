@@ -58,6 +58,8 @@ pub struct Inner {
     pub init_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     pub bridge_last_used: HashMap<String, Instant>,
     pub qq: Option<QqHandle>,
+    /// IDE 文件监听（外部改动同步）。setup 阶段注入。
+    pub ide_watcher: Option<crate::ide::watch::IdeWatcher>,
 }
 
 pub struct AppState {
@@ -86,6 +88,7 @@ impl Default for AppState {
                 init_locks: HashMap::new(),
                 bridge_last_used: HashMap::new(),
                 qq: None,
+                ide_watcher: None,
             })),
             last_request_at: Mutex::new(None),
         }

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>力工 IDE</title>
+  <link rel="stylesheet" href="ide.css" />
+  <link rel="stylesheet" href="../vendor/monaco/vs/editor/editor.main.css" />
+</head>
+<body>
+  <!-- 顶部标题栏（可拖动） -->
+  <header id="titlebar" class="titlebar">
+    <div class="traffic" id="win-controls">
+      <button class="tl-btn close" data-win="close" title="关闭"></button>
+      <button class="tl-btn min" data-win="min" title="最小化"></button>
+      <button class="tl-btn max" data-win="max" title="最大化"></button>
+    </div>
+    <div class="title-center">
+      <span class="title-dot"></span>
+      <span id="project-name" class="project-name">IDE</span>
+      <span id="dirty-flag" class="dirty-flag hidden">●</span>
+    </div>
+    <div class="title-right">
+      <button id="undo-btn" class="icon-act" title="撤回 (Ctrl+Z)">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none"><path d="M9 7L4 12l5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 12h9a6 6 0 010 12h-2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button id="redo-btn" class="icon-act" title="前进 (Ctrl+Y / Ctrl+Shift+Z)">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none"><path d="M15 7l5 5-5 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 12H11a6 6 0 000 12h2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button id="save-btn" class="icon-act" title="保存 (Ctrl+S)">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none"><path d="M5 4h11l3 3v13H5z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8 4v5h7V4M8 20v-6h8v6" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- 左侧：文件树 -->
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-head">
+        <span class="sidebar-title">资源管理器</span>
+        <div class="sidebar-actions">
+          <button id="up-btn" class="icon-btn" title="上一层">↑</button>
+          <button id="refresh-btn" class="icon-btn" title="刷新">⟳</button>
+        </div>
+      </div>
+      <div id="sidebar-path" class="sidebar-path" title="当前文件夹">/</div>
+      <div class="search-wrap">
+        <input id="file-search" class="file-search" type="text" placeholder="搜索文件…" />
+      </div>
+      <div id="file-tree" class="file-tree"></div>
+    </aside>
+
+    <!-- 拖拽分隔条 -->
+    <div id="splitter" class="splitter"></div>
+
+    <!-- 右侧：编辑器 -->
+    <main class="editor-area">
+      <div id="tabs" class="tabs"></div>
+      <div class="breadcrumb" id="breadcrumb"></div>
+      <div id="editor-host" class="editor-host">
+        <div id="welcome" class="welcome">
+          <div class="welcome-logo">⌘</div>
+          <div class="welcome-title">力工 IDE</div>
+          <div class="welcome-sub">从左侧选择一个文件开始编辑</div>
+        </div>
+        <div id="monaco-host" class="monaco-host hidden"></div>
+        <div id="preview-host" class="preview-host hidden"></div>
+        <div id="agent-diff-banner" class="agent-diff-banner hidden">
+          <span id="agent-diff-title">Agent 改动</span>
+          <button id="btn-diff-mode" type="button">并排/内联</button>
+          <button id="btn-close-diff" type="button">返回编辑</button>
+        </div>
+        <div id="diff-host" class="diff-host hidden"></div>
+      </div>
+      <div id="statusbar" class="statusbar">
+        <span id="status-path">就绪</span>
+        <span id="status-meta"></span>
+      </div>
+    </main>
+  </div>
+
+  <!-- 自定义模态：新建/重命名输入 & 删除确认 -->
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-title" id="modal-title">标题</div>
+      <div class="modal-body">
+        <input id="modal-input" class="modal-input" type="text" />
+        <div id="modal-text" class="modal-text hidden"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="modal-btn">取消</button>
+        <button id="modal-ok" class="modal-btn primary">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="../vendor/monaco/vs/loader.js"></script>
+  <script type="module" src="ide.js"></script>
+</body>
+</html>

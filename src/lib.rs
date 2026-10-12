@@ -8,6 +8,7 @@ use tauri::Manager;
 pub mod bootstrap;
 pub mod commands;
 pub mod env_probe;
+pub mod ide;
 pub mod logging;
 pub mod notify;
 #[cfg(windows)]
@@ -28,7 +29,7 @@ pub fn run() {
     bootstrap::release_seed_accounts();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|_app| {
+        .setup(|app| {
             #[cfg(windows)]
             {
                 notify_win::set_app_id();
@@ -36,12 +37,21 @@ pub fn run() {
                     notify_win::ensure_shortcut();
                 });
             }
+            // 初始化 IDE 文件监听（外部改动同步）。
+            let handle = app.handle().clone();
+            let state = app.state::<state::AppState>();
+            let inner = state.inner.clone();
+            tauri::async_runtime::spawn(async move {
+                match ide::watch::IdeWatcher::new(handle) {
+                    Ok(w) => inner.lock().await.ide_watcher = Some(w),
+                    Err(e) => eprintln!("IDE 文件监听初始化失败: {e}"),
+                }
+            });
             Ok(())
         })
         .manage(state::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::account_status,
-            commands::log_frontend,
             commands::list_accounts,
             commands::login,
             commands::list_projects,
@@ -89,10 +99,79 @@ pub fn run() {
             commands::attach_account_session,
             commands::qq_status,
             commands::qq_toggle,
+            ide::fs::ide_list_dir,
+            ide::fs::ide_read_file,
+            ide::fs::ide_write_file,
+            ide::fs::ide_delete,
+            ide::fs::ide_restore,
+            ide::fs::ide_purge_trash,
+            ide::fs::ide_copy,
+            ide::fs::ide_move,
+            ide::fs::ide_create,
+            ide::preview::ide_read_binary,
+            ide::preview::ide_open_external,
+            ide::window::open_ide_window,
+            ide::window::close_ide_window,
         ])
         .on_window_event(|window, event| {
+            // IDE 子窗口关闭：移除该项目文件监听，不触碰 bridge / 浏览器。
+            if window.label().starts_with("ide-") {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    let project_id = window.label().trim_start_matches("ide-").to_string();
+                    let state = window.state::<state::AppState>();
+                    let inner = state.inner.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let mut guard = inner.lock().await;
+                        if let Some(w) = guard.ide_watcher.as_mut() {
+                            w.remove(&project_id);
+                        }
+                    });
+                }
+                return;
+            }
+            // 只有主窗口关闭时才清理 bridge / 浏览器；
+            // IDE 等子窗口关闭不应影响主程序的浏览器会话。
+            if window.label() != "main" {
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { .. } = event {
+                // 主窗口关闭时，先关掉所有 IDE 子窗口（否则会残留）。
+                for (label, win) in window.app_handle().webview_windows() {
+                    if label.starts_with("ide-") {
+                        let _ = win.destroy();
+                    }
+                }
+                // 清理各项目根下的 IDE 暂存区。
                 let state = window.state::<state::AppState>();
+                // 停止全部 IDE 文件监听。
+                {
+                    let inner = state.inner.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let mut guard = inner.lock().await;
+                        let pids: Vec<String> = match &guard.ide_watcher {
+                            Some(w) => w.project_ids(),
+                            None => Vec::new(),
+                        };
+                        if let Some(w) = guard.ide_watcher.as_mut() {
+                            for pid in pids {
+                                w.remove(&pid);
+                            }
+                        }
+                    });
+                }
+                let roots: Vec<String> = {
+                    let state_inner = state.inner.clone();
+                    tauri::async_runtime::block_on(async move {
+                        let guard = state_inner.lock().await;
+                        guard.projects.workdir_by_project.values().cloned().collect()
+                    })
+                };
+                for root in roots {
+                    let trash = std::path::Path::new(&root).join(ide::fs::TRASH_DIR);
+                    if trash.is_dir() {
+                        let _ = std::fs::remove_dir_all(&trash);
+                    }
+                }
                 let inner = state.inner.clone();
                 tauri::async_runtime::block_on(async move {
                     let bridges: Vec<_> = {
