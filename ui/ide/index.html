@@ -34,9 +34,21 @@
   </header>
 
   <div class="layout">
-    <!-- 左侧：文件树 + 源代码管理 -->
+    <!-- 左侧：活动栏 + 面板 -->
     <aside id="sidebar" class="sidebar">
-      <div class="sidebar-pane explorer-pane">
+      <!-- 活动栏（VSCode 风格） -->
+      <div id="activitybar" class="activitybar">
+        <button class="act-item active" data-view="explorer" title="资源管理器">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M3 6.5A1.5 1.5 0 014.5 5h4l2 2h7A1.5 1.5 0 0119 8.5v8A1.5 1.5 0 0117.5 18h-13A1.5 1.5 0 013 16.5v-10z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+        </button>
+        <button class="act-item" data-view="scm" title="源代码管理">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none"><circle cx="7" cy="6" r="2.2" stroke="currentColor" stroke-width="1.5"/><circle cx="7" cy="18" r="2.2" stroke="currentColor" stroke-width="1.5"/><circle cx="17" cy="9" r="2.2" stroke="currentColor" stroke-width="1.5"/><path d="M7 8.2v7.6M17 11.2c0 3-2.5 4-6 4.3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <span id="act-scm-badge" class="act-badge hidden"></span>
+        </button>
+      </div>
+
+      <!-- 资源管理器面板 -->
+      <div class="sidebar-pane explorer-pane" id="explorer-pane">
         <div class="sidebar-head">
           <span class="sidebar-title">资源管理器</span>
           <div class="sidebar-actions">
@@ -51,14 +63,19 @@
         <div id="file-tree" class="file-tree"></div>
       </div>
 
-      <div class="sidebar-pane scm-pane" id="scm-pane">
+      <!-- 源代码管理面板 -->
+      <div class="sidebar-pane scm-pane hidden" id="scm-pane">
         <div class="sidebar-head scm-head">
           <span class="sidebar-title">源代码管理</span>
           <div class="sidebar-actions">
-            <span id="scm-branch" class="scm-branch hidden"></span>
+            <button id="scm-branch" class="scm-branch hidden" title="分支"></button>
             <span id="scm-sync" class="scm-sync hidden"></span>
             <button id="scm-refresh-btn" class="icon-btn" title="刷新">⟳</button>
           </div>
+        </div>
+        <div class="scm-tabs">
+          <button id="scm-tab-changes" class="scm-tab active">更改</button>
+          <button id="scm-tab-history" class="scm-tab">历史</button>
         </div>
         <div id="scm-toolbar" class="scm-toolbar hidden">
           <button id="scm-stage-all" class="scm-tool" title="全部暂存">
@@ -71,13 +88,14 @@
         <div id="scm-body" class="scm-body">
           <div id="scm-empty" class="scm-empty">未检测到 Git 仓库</div>
           <div id="scm-groups" class="scm-groups"></div>
-          <div id="scm-commit-wrap" class="scm-commit-wrap hidden">
-            <textarea id="scm-message" class="scm-message" rows="2" placeholder="提交信息（Ctrl+Enter 提交）"></textarea>
-            <div class="scm-commit-actions">
-              <button id="scm-commit-btn" class="scm-btn primary" title="提交已暂存更改">提交</button>
-              <button id="scm-pull-btn" class="scm-btn" title="从远程拉取">拉取</button>
-              <button id="scm-push-btn" class="scm-btn" title="推送到远程">推送</button>
-            </div>
+          <div id="scm-history" class="scm-history hidden"></div>
+        </div>
+        <div id="scm-commit-wrap" class="scm-commit-wrap hidden">
+          <textarea id="scm-message" class="scm-message" rows="2" placeholder="提交信息（Ctrl+Enter 提交）"></textarea>
+          <div class="scm-commit-actions">
+            <button id="scm-commit-btn" class="scm-btn primary" title="提交已暂存更改">提交</button>
+            <button id="scm-pull-btn" class="scm-btn" title="从远程拉取">拉取</button>
+            <button id="scm-push-btn" class="scm-btn" title="推送到远程">推送</button>
           </div>
         </div>
       </div>
@@ -106,7 +124,7 @@
         <div id="git-diff-banner" class="agent-diff-banner git-diff-banner hidden">
           <span id="git-diff-title">更改</span>
           <button id="btn-git-diff-mode" type="button">并排/内联</button>
-          <button id="btn-close-git-diff" type="button">返回编辑</button>
+          <button id="btn-close-git-diff" type="button">跳转到文件</button>
         </div>
         <div id="diff-host" class="diff-host hidden"></div>
       </div>

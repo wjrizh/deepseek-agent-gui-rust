@@ -8,6 +8,7 @@ import {
   deletePath, copyPath, movePath, createPath, restorePath, purgeTrash,
   getWorkdir, setWorkdir, getRestrict, setRestrict,
   gitStatus, gitDiff, gitStage, gitUnstage, gitDiscard, gitCommit, gitPush, gitPull,
+  gitBranches, gitBranchCreate, gitCheckout, gitBranchDelete, gitLog, gitShow, gitReset,
 } from "./api.js";
 
 // 剪贴板：仅记录一次复制/剪切操作的相对路径，粘贴时读取。
@@ -50,9 +51,16 @@ const els = {
   scmToolbar: document.getElementById("scm-toolbar"),
   scmStageAll: document.getElementById("scm-stage-all"),
   scmUnstageAll: document.getElementById("scm-unstage-all"),
+  activitybar: document.getElementById("activitybar"),
+  explorerPane: document.getElementById("explorer-pane"),
+  scmPane: document.getElementById("scm-pane"),
+  actBadge: document.getElementById("act-scm-badge"),
   scmBody: document.getElementById("scm-body"),
   scmEmpty: document.getElementById("scm-empty"),
   scmGroups: document.getElementById("scm-groups"),
+  scmHistory: document.getElementById("scm-history"),
+  scmTabChanges: document.getElementById("scm-tab-changes"),
+  scmTabHistory: document.getElementById("scm-tab-history"),
   scmCommitWrap: document.getElementById("scm-commit-wrap"),
   scmMessage: document.getElementById("scm-message"),
   scmCommitBtn: document.getElementById("scm-commit-btn"),
@@ -173,7 +181,7 @@ function ensureDiffEditor() {
   els.btnCloseDiff.onclick = closeAgentDiff;
   els.btnDiffMode.onclick = () => toggleDiffMode();
   els.btnGitDiffMode.onclick = () => toggleDiffMode();
-  els.btnCloseGitDiff.onclick = () => closeGitDiff();
+  els.btnCloseGitDiff.onclick = () => gotoGitDiffFile();
 }
 
 function toggleDiffMode() {
@@ -334,6 +342,31 @@ function gitStatusClass(gf) {
   return "modified";
 }
 
+// 目录状态：取其下所有文件状态的最高优先。
+// 优先级：冲突 C > 更改 M/D > 新增 A > 未跟踪 U > 已暂存。
+function dirGitCode(rel, map) {
+  const prefix = rel + "/";
+  let best = "";
+  let bestScore = -1;
+  for (const [frel, gf] of map) {
+    if (!frel.startsWith(prefix)) continue;
+    const code = gitCode(gf);
+    if (!code) continue;
+    let score;
+    if (gf.conflicted) score = 5;
+    else if (gf.untracked) score = 2;
+    else {
+      const staged = gf.staged !== " " && gf.staged !== "";
+      const worktree = gf.worktree !== " " && gf.worktree !== "";
+      if (worktree) score = 4;            // 工作区有改动
+      else if (staged && gf.staged === "A") score = 3;
+      else score = 1;                     // 仅暂存
+    }
+    if (score > bestScore) { bestScore = score; best = code; }
+  }
+  return best;
+}
+
 // 刷新文件树着色（不改结构，只改类名/角标）。
 function refreshGitDecorations() {
   const host = els.treeHost;
@@ -344,10 +377,10 @@ function refreshGitDecorations() {
     if (!rel) return;
     const isDir = row.dataset.isDir === "1";
     const gf = isDir ? null : map.get(rel);
-    const code = isDir ? "" : gitCode(gf);
+    const code = isDir ? dirGitCode(rel, map) : gitCode(gf);
     const existing = row.querySelector(".git-badge");
     if (code) {
-      row.dataset.gitStatus = gitStatusClass(gf);
+      row.dataset.gitCode = code;
       if (existing) existing.textContent = code;
       else {
         const b = document.createElement("span");
@@ -356,7 +389,7 @@ function refreshGitDecorations() {
         row.append(b);
       }
     } else {
-      delete row.dataset.gitStatus;
+      delete row.dataset.gitCode;
       if (existing) existing.remove();
     }
   });
@@ -372,7 +405,7 @@ function refreshTabDecorations() {
     const code = gitCode(gf);
     let badge = tab.querySelector(".tab-git");
     if (code) {
-      tab.dataset.gitStatus = gitStatusClass(gf);
+      tab.dataset.gitCode = code;
       if (!badge) {
         badge = document.createElement("span");
         badge.className = "tab-git";
@@ -380,7 +413,7 @@ function refreshTabDecorations() {
       }
       badge.textContent = code;
     } else {
-      delete tab.dataset.gitStatus;
+      delete tab.dataset.gitCode;
       badge?.remove();
     }
   });
@@ -393,6 +426,144 @@ function scmGroupLabel(gf) {
   const worktree = gf.worktree !== " " && gf.worktree !== "";
   if (staged && !worktree) return "已暂存";
   return "更改";
+}
+
+// 当前页签：changes | history
+let scmTab = "changes";
+
+function switchScmTab(tab) {
+  scmTab = tab;
+  els.scmTabChanges.classList.toggle("active", tab === "changes");
+  els.scmTabHistory.classList.toggle("active", tab === "history");
+  const isChanges = tab === "changes";
+  els.scmGroups.classList.toggle("hidden", !isChanges);
+  els.scmToolbar.classList.toggle("hidden", !isChanges || !gitState || !gitState.is_repo);
+  els.scmHistory.classList.toggle("hidden", isChanges);
+  if (isChanges) {
+    renderScmGroups();
+  } else {
+    renderHistory();
+  }
+}
+
+// 分支下拉。
+let branchMenuEl = null;
+function closeBranchMenu() {
+  if (branchMenuEl) { branchMenuEl.remove(); branchMenuEl = null; }
+}
+async function openBranchMenu() {
+  if (branchMenuEl) { closeBranchMenu(); return; }
+  let branches = [];
+  try { branches = await gitBranches(projectId); }
+  catch (e) { els.statusPath.textContent = "读取分支失败：" + e; return; }
+
+  const menu = document.createElement("div");
+  menu.className = "branch-menu";
+  const rect = els.scmBranch.getBoundingClientRect();
+  menu.style.left = Math.max(8, rect.left) + "px";
+  menu.style.top = (rect.bottom + 4) + "px";
+
+  const head = document.createElement("div");
+  head.className = "branch-menu-head";
+  head.textContent = "分支";
+  menu.append(head);
+
+  for (const b of branches) {
+    const item = document.createElement("div");
+    item.className = "branch-item" + (b.current ? " current" : "");
+    const dot = document.createElement("span");
+    dot.className = "branch-check";
+    dot.textContent = b.current ? "✓" : "";
+    const nm = document.createElement("span");
+    nm.className = "branch-name";
+    nm.textContent = b.name;
+    item.append(dot, nm);
+    if (!b.current) {
+      const del = document.createElement("button");
+      del.className = "branch-del";
+      del.textContent = "✕";
+      del.title = "删除分支";
+      del.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const ok = await showModal({ title: "删除分支", text: `删除本地分支「${b.name}」？`, okText: "删除", danger: true });
+        if (!ok) return;
+        try { await gitBranchDelete(projectId, b.name, true); closeBranchMenu(); await refreshGit(); }
+        catch (err) { els.statusPath.textContent = "删除失败：" + err; }
+      });
+      item.append(del);
+    }
+    if (!b.current) {
+      item.addEventListener("click", async () => {
+        try { await gitCheckout(projectId, b.name); closeBranchMenu(); await refreshGit(); await tree?.refresh(); }
+        catch (err) { els.statusPath.textContent = "切换失败：" + err; }
+      });
+    }
+    menu.append(item);
+  }
+
+  const newBtn = document.createElement("div");
+  newBtn.className = "branch-new";
+  newBtn.textContent = "＋ 新建分支…";
+  newBtn.addEventListener("click", async () => {
+    closeBranchMenu();
+    const name = await showModal({ title: "新建分支", input: true, text: "输入新分支名（将从当前 HEAD 创建）", okText: "创建" });
+    if (!name) return;
+    try { await gitBranchCreate(projectId, name); await refreshGit(); await tree?.refresh(); }
+    catch (e) { els.statusPath.textContent = "创建失败：" + e; }
+  });
+  menu.append(newBtn);
+
+  document.body.append(menu);
+  branchMenuEl = menu;
+
+  setTimeout(() => {
+    const onDoc = (e) => {
+      if (!menu.contains(e.target) && e.target !== els.scmBranch) {
+        closeBranchMenu();
+        document.removeEventListener("mousedown", onDoc);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+  }, 0);
+}
+
+async function renderHistory() {
+  const wrap = els.scmHistory;
+  wrap.innerHTML = "";
+  let commits = [];
+  try { commits = await gitLog(projectId, 100); }
+  catch (e) { wrap.textContent = "读取历史失败：" + e; return; }
+  if (!commits.length) {
+    const e = document.createElement("div");
+    e.className = "scm-clean";
+    e.textContent = "没有提交";
+    wrap.append(e);
+    return;
+  }
+  for (const c of commits) {
+    const row = document.createElement("div");
+    row.className = "hist-row";
+    row.dataset.hash = c.hash;
+    row.title = `${c.hash}\n${c.author}  ${c.time}`;
+
+    const subj = document.createElement("div");
+    subj.className = "hist-subj";
+    subj.textContent = c.subject || "(无提交信息)";
+    const meta = document.createElement("div");
+    meta.className = "hist-meta";
+    meta.textContent = `${c.short} · ${c.author} · ${c.time}`;
+    row.append(subj, meta);
+    row.addEventListener("click", () => openCommitDiff(c));
+    wrap.append(row);
+  }
+}
+
+// 查看某提交的 diff（整个提交）。
+async function openCommitDiff(c) {
+  let text;
+  try { text = await gitShow(projectId, c.hash, null); }
+  catch (e) { els.statusPath.textContent = "Diff 失败：" + e; return; }
+  await showDiffText(`${c.short} ${c.subject}`, text, { hash: c.hash });
 }
 
 async function refreshGit() {
@@ -431,9 +602,10 @@ async function refreshGit() {
     els.scmSync.classList.add("hidden");
   }
 
-  renderScmGroups();
+  switchScmTab(scmTab);
   refreshGitDecorations();
   refreshTabDecorations();
+  updateActBadge();
 }
 
 function renderScmGroups() {
@@ -540,7 +712,14 @@ async function openGitDiff(rel, staged) {
   let text;
   try { text = await gitDiff(projectId, rel, staged); }
   catch (e) { els.statusPath.textContent = "Diff 失败：" + e; return; }
+  await showDiffText(`${rel}（${staged ? "已暂存" : "工作区"}）`, text, {
+    jumpRel: rel,
+    key: rel + "|" + (staged ? "staged" : "worktree"),
+  });
+}
 
+// 通用 diff 展示：`opts.jumpRel` 有值则 banner 显示「跳转到文件」，否则隐藏该按钮。
+async function showDiffText(title, text, opts = {}) {
   await ensureEditor();
   ensureDiffEditor();
   if (!diffEditor || !monaco) return;
@@ -552,12 +731,12 @@ async function openGitDiff(rel, staged) {
   els.gitDiffBanner.classList.remove("hidden");
   els.agentDiffBanner.classList.add("hidden");
 
-  const lang = langForPath(rel);
+  const relForLang = opts.jumpRel || title;
+  const lang = langForPath(relForLang);
   const nonce = Date.now() + "_" + Math.random().toString(36).slice(2);
-  const oldUri = monaco.Uri.parse(`inmemory://git-diff/${nonce}/original/${rel}`);
-  const newUri = monaco.Uri.parse(`inmemory://git-diff/${nonce}/modified/${rel}`);
-  // 解析 unified diff：以 "+++ "/"--- " 后的内容为简单近似；失败则整段放修改侧。
-  const { original, modified } = splitUnifiedDiff(text, rel);
+  const oldUri = monaco.Uri.parse(`inmemory://git-diff/${nonce}/original`);
+  const newUri = monaco.Uri.parse(`inmemory://git-diff/${nonce}/modified`);
+  const { original, modified } = splitUnifiedDiff(text, relForLang);
   const oldModel = monaco.editor.createModel(original, lang, oldUri);
   const newModel = monaco.editor.createModel(modified, lang, newUri);
   const prev = diffEditor.getModel();
@@ -565,9 +744,11 @@ async function openGitDiff(rel, staged) {
   if (prev) { prev.original?.dispose(); prev.modified?.dispose(); }
   diffEditor.layout();
   gitDiffActive = true;
-  gitDiffKey = rel + "|" + (staged ? "staged" : "worktree");
-  els.gitDiffTitle.textContent = `${rel}（${staged ? "已暂存" : "工作区"}）`;
-  els.statusPath.textContent = rel + "（Git Diff）";
+  gitDiffKey = opts.key || null;
+  els.gitDiffTitle.textContent = title;
+  els.statusPath.textContent = title;
+  els.btnCloseGitDiff.style.display = opts.jumpRel ? "" : "none";
+  els.btnCloseGitDiff.textContent = "跳转到文件";
 }
 
 // 极简 unified diff 还原：无 diff 头时把文本当修改侧。
@@ -589,6 +770,16 @@ function splitUnifiedDiff(text, rel) {
   return { original: oldLines.join("\n"), modified: newLines.join("\n") };
 }
 
+// 从 Git diff 跳转到该文件：关闭 diff，打开文件，展开并选中文件树对应行。
+async function gotoGitDiffFile() {
+  const rel = gitDiffKey ? gitDiffKey.split("|")[0] : null;
+  closeGitDiff();
+  if (!rel) return;
+  const name = rel.split("/").pop();
+  await openFile(rel, name);
+  if (tree && tree.reveal) await tree.reveal(rel);
+}
+
 function closeGitDiff() {
   if (!gitDiffActive) return;
   const m = diffEditor.getModel();
@@ -606,8 +797,33 @@ function closeGitDiff() {
   if (editor) { editor.layout(); diffViewState = null; }
 }
 
+// 活动栏：切换 资源管理器 / 源代码管理 面板（一次显示一个）。
+let activeView = "explorer";
+function switchView(view) {
+  activeView = view;
+  els.activitybar.querySelectorAll(".act-item").forEach((b) => {
+    b.classList.toggle("active", b.dataset.view === view);
+  });
+  els.explorerPane.classList.toggle("hidden", view !== "explorer");
+  els.scmPane.classList.toggle("hidden", view !== "scm");
+  if (view === "scm") refreshGit();
+}
+
+// 活动栏 SCM 图标上的更改数角标。
+function updateActBadge() {
+  const n = gitState && gitState.is_repo ? gitState.files.length : 0;
+  els.actBadge.classList.toggle("hidden", n === 0);
+  els.actBadge.textContent = n > 99 ? "99+" : String(n);
+}
+
 function installScm() {
+  els.activitybar?.querySelectorAll(".act-item").forEach((b) => {
+    b.addEventListener("click", () => switchView(b.dataset.view));
+  });
   els.scmRefreshBtn?.addEventListener("click", refreshGit);
+  els.scmTabChanges?.addEventListener("click", () => switchScmTab("changes"));
+  els.scmTabHistory?.addEventListener("click", () => switchScmTab("history"));
+  els.scmBranch?.addEventListener("click", openBranchMenu);
   els.scmCommitBtn?.addEventListener("click", doCommit);
   els.scmPullBtn?.addEventListener("click", doPull);
   els.scmPushBtn?.addEventListener("click", doPush);

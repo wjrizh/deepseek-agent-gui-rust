@@ -504,9 +504,33 @@ export function createTree(host, projectId, onOpenFile, restrict, opts = {}) {
     applyDirty();
   }
 
+  // 逐级展开到 rel，并选中该行（用于“跳转到文件”）。
+  async function reveal(rel) {
+    if (!rel) return;
+    const parts = rel.split("/");
+    for (let i = 1; i <parts.length; i++) {
+      const dir = parts.slice(0, i).join("/");
+      const row = host.querySelector('.tree-row[data-rel="' + CSS.escape(dir) + '"]');
+      if (!row) break;
+      const expanded = state.get(dir)?.expanded;
+      if (!expanded) {
+        row.click();
+        await waitDirLoaded(dir);
+      }
+    }
+    selectSingle(rel);
+    const target = host.querySelector('.tree-row[data-rel="' + CSS.escape(rel) + '"]');
+    if (target) {
+      target.classList.add("active");
+      host.querySelectorAll(".tree-row.active").forEach((r) => { if (r !== target) r.classList.remove("active"); });
+      host.dataset.active = rel;
+      target.scrollIntoView({ block: "nearest" });
+    }
+  }
+
   return {
     refresh, goUp, search, setRoot, getRoot: () => rootRel,
     getSelection, clearSelection, startRename, selectSingle, setDirty,
-    applyChanges,
+    applyChanges, reveal,
   };
 }

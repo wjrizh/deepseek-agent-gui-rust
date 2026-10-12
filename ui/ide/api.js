@@ -93,6 +93,34 @@ export function gitPull(projectId) {
   return invoke("ide_git_pull", { projectId });
 }
 
+export function gitBranches(projectId) {
+  return invoke("ide_git_branches", { projectId });
+}
+
+export function gitBranchCreate(projectId, name, from) {
+  return invoke("ide_git_branch_create", { projectId, name, from: from || null });
+}
+
+export function gitCheckout(projectId, name) {
+  return invoke("ide_git_checkout", { projectId, name });
+}
+
+export function gitBranchDelete(projectId, name, force) {
+  return invoke("ide_git_branch_delete", { projectId, name, force: !!force });
+}
+
+export function gitLog(projectId, limit) {
+  return invoke("ide_git_log", { projectId, limit: limit || null });
+}
+
+export function gitShow(projectId, hash, relPath) {
+  return invoke("ide_git_show", { projectId, hash, relPath: relPath || null });
+}
+
+export function gitReset(projectId, hash, mode) {
+  return invoke("ide_git_reset", { projectId, hash, mode });
+}
+
 export function getRestrict(projectId) {
   return invoke("get_restrict", { projectId });
 }

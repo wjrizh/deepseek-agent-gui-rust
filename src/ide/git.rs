@@ -318,6 +318,217 @@ pub async fn ide_git_pull(
     Ok(format!("{}{}", out, err))
 }
 
+/// 分支信息。
+#[derive(Debug, Clone, Serialize)]
+pub struct GitBranch {
+    pub name: String,
+    pub current: bool,
+    pub upstream: String,
+}
+
+/// 列出本地分支。
+#[tauri::command]
+pub async fn ide_git_branches(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<GitBranch>, String> {
+    let root = project_root(&state, &project_id).await?;
+    if !is_repo(&root) {
+        return Ok(Vec::new());
+    }
+    let cur = run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map(|(_, o, _)| o.trim().to_string())
+        .unwrap_or_default();
+    let (ok, out, err) = run_git(
+        &root,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)\t%(upstream:short)",
+            "refs/heads",
+        ],
+    )?;
+    if !ok {
+        return Err(format!("列出分支失败：{}", err.trim()));
+    }
+    let mut branches = Vec::new();
+    for line in out.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, upstream) = match line.split_once('\t') {
+            Some((n, u)) => (n.to_string(), u.to_string()),
+            None => (line.to_string(), String::new()),
+        };
+        branches.push(GitBranch {
+            current: name == cur,
+            name,
+            upstream,
+        });
+    }
+    branches.sort_by(|a, b| b.current.cmp(&a.current).then_with(|| a.name.cmp(&b.name)));
+    Ok(branches)
+}
+
+/// 创建并切换到新分支。
+#[tauri::command]
+pub async fn ide_git_branch_create(
+    project_id: String,
+    name: String,
+    from: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("分支名不能为空".into());
+    }
+    let root = project_root(&state, &project_id).await?;
+    let base = from.unwrap_or_default();
+    let args: Vec<&str> = if base.trim().is_empty() {
+        vec!["checkout", "-b", name]
+    } else {
+        vec!["checkout", "-b", name, base.trim()]
+    };
+    let (ok, _, err) = run_git(&root, &args)?;
+    if !ok {
+        return Err(format!("创建分支失败：{}", err.trim()));
+    }
+    Ok(())
+}
+
+/// 切换分支。
+#[tauri::command]
+pub async fn ide_git_checkout(
+    project_id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = project_root(&state, &project_id).await?;
+    let (ok, out, err) = run_git(&root, &["checkout", name.trim()])?;
+    if !ok {
+        return Err(format!("切换分支失败：{}", err.trim()));
+    }
+    Ok(format!("{}{}", out, err))
+}
+
+/// 删除本地分支。
+#[tauri::command]
+pub async fn ide_git_branch_delete(
+    project_id: String,
+    name: String,
+    force: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let root = project_root(&state, &project_id).await?;
+    let flag = if force { "-D" } else { "-d" };
+    let (ok, _, err) = run_git(&root, &["branch", flag, name.trim()])?;
+    if !ok {
+        return Err(format!("删除分支失败：{}", err.trim()));
+    }
+    Ok(())
+}
+
+/// 提交日志条目。
+#[derive(Debug, Clone, Serialize)]
+pub struct GitCommit {
+    pub hash: String,
+    pub short: String,
+    pub subject: String,
+    pub author: String,
+    pub time: String,
+}
+
+/// 读取提交日志。
+#[tauri::command]
+pub async fn ide_git_log(
+    project_id: String,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Vec<GitCommit>, String> {
+    let root = project_root(&state, &project_id).await?;
+    if !is_repo(&root) {
+        return Ok(Vec::new());
+    }
+    let n = limit.unwrap_or(100).to_string();
+    let (ok, out, err) = run_git(
+        &root,
+        &[
+            "log",
+            &format!("-n{n}"),
+            "--pretty=format:%H\x1f%h\x1f%s\x1f%an\x1f%ad",
+            "--date=format:%Y-%m-%d %H:%M",
+        ],
+    )?;
+    if !ok {
+        if err.contains("does not have any commits") || err.contains("unknown revision") {
+            return Ok(Vec::new());
+        }
+        return Err(format!("读取日志失败：{}", err.trim()));
+    }
+    let mut commits = Vec::new();
+    for line in out.split('\u{1e}') {
+        let line = line.trim_matches(['\n', '\r', '\u{1e}']);
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\u{1f}').collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        commits.push(GitCommit {
+            hash: parts[0].to_string(),
+            short: parts[1].to_string(),
+            subject: parts[2].to_string(),
+            author: parts[3].to_string(),
+            time: parts[4].to_string(),
+        });
+    }
+    Ok(commits)
+}
+
+/// 查看某提交的 diff。
+#[tauri::command]
+pub async fn ide_git_show(
+    project_id: String,
+    hash: String,
+    rel_path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = project_root(&state, &project_id).await?;
+    let rel = rel_path.unwrap_or_default();
+    let mut args = vec!["show", "--no-color", "--no-ext-diff", "--format=", hash.as_str()];
+    if !rel.is_empty() {
+        args.push("--");
+        args.push(&rel);
+    }
+    let (ok, out, err) = run_git(&root, &args)?;
+    if !ok {
+        return Err(format!("git show 失败：{}", err.trim()));
+    }
+    Ok(out)
+}
+
+/// 还原：reset 到某提交（soft/mixed/hard）。
+#[tauri::command]
+pub async fn ide_git_reset(
+    project_id: String,
+    hash: String,
+    mode: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let root = project_root(&state, &project_id).await?;
+    let m = match mode.as_str() {
+        "soft" | "mixed" | "hard" => mode.as_str(),
+        _ => "mixed",
+    };
+    let flag = format!("--{m}");
+    let (ok, out, err) = run_git(&root, &["reset", &flag, hash.trim()])?;
+    if !ok {
+        return Err(format!("git reset 失败：{}", err.trim()));
+    }
+    Ok(format!("{}{}", out, err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_status;
