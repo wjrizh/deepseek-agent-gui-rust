@@ -6,6 +6,7 @@
 //! - `window`：打开 / 复用 IDE 独立窗口。
 
 pub mod fs;
+pub mod git;
 pub mod path;
 pub mod preview;
 pub mod watch;
