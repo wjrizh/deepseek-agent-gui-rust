@@ -1134,8 +1134,19 @@ async function openFile(rel, name) {
 
   const kind = previewKind(name);
   if (kind) {
-    const dispose = await mountPreview(rel, name);
-    openDocs.set(rel, { kind: "preview", dirty: false, dispose });
+    // 每个预览文档拥有独立常驻容器，与文本文档的常驻 model 对称。
+    const el = document.createElement("div");
+    el.className = "preview-item hidden";
+    els.previewHost.append(el);
+    let dispose = () => {};
+    try {
+      dispose = await renderPreview(el, projectId, rel, name);
+    } catch (e) {
+      els.statusPath.textContent = "预览失败：" + e;
+      el.remove();
+      return;
+    }
+    openDocs.set(rel, { kind: "preview", dirty: false, el, dispose });
     activateTab(rel);
     return;
   }
@@ -1157,19 +1168,6 @@ async function openFile(rel, name) {
   activateTab(rel);
 }
 
-// 挂载预览到 preview-host，返回 dispose。若已挂载同文件则复用。
-let mountedPreviewRel = null;
-async function mountPreview(rel, name) {
-  if (mountedPreviewRel === rel) return () => {};
-  els.previewHost.innerHTML = "";
-  mountedPreviewRel = rel;
-  const res = await renderPreview(els.previewHost, projectId, rel, name);
-  return () => {
-    if (mountedPreviewRel === rel) mountedPreviewRel = null;
-    res.dispose();
-  };
-}
-
 function activateTab(rel) {
   if (diffActive) closeAgentDiff(false);
   if (gitDiffActive) closeGitDiff();
@@ -1185,6 +1183,10 @@ function activateTab(rel) {
   els.monacoHost.classList.toggle("hidden", isPreview);
   if (isPreview) {
     if (editor) editor.setModel(null);
+    // 显示当前预览、隐藏其它预览（各自常驻，切换零成本）。
+    for (const [r, d] of openDocs) {
+      if (d.kind === "preview" && d.el) d.el.classList.toggle("hidden", r !== rel);
+    }
   } else {
     editor.setModel(doc.model);
   }
@@ -1206,8 +1208,10 @@ async function closeTab(rel) {
     });
     if (!ok) return;
   }
-  doc.dispose?.();
-  doc.model?.dispose?.();
+  // 释放资源；任一步失败都不能阻断标签移除。
+  try { doc.dispose?.(); } catch {}
+  try { doc.model?.dispose?.(); } catch {}
+  try { doc.el?.remove(); } catch {}
   openDocs.delete(rel);
   if (activeRel === rel) {
     const next = openDocs.keys().next().value || null;

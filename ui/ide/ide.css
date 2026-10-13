@@ -889,3 +889,14 @@ html, body {
   cursor: ns-resize;
   z-index: 5;
 }
+
+/* 每个预览文档独立常驻容器（与文本 model 对称，支持多预览切换）。 */
+.preview-item {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg, #1e1e1e);
+  overflow: hidden;
+}
+.preview-item.hidden { display: none; }
