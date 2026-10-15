@@ -81,6 +81,10 @@ export function render(root, store) {
     applyToolState(cards[i], toolMsgs[i]);
   }
   if (nearBottom) root.scrollTop = root.scrollHeight;
+
+  for (const s of store.subAgents.values()) {
+    root.append(subAgentCard(s));
+  }
 }
 
 // 仅更新运行/停止按钮状态。
@@ -88,4 +92,32 @@ export function updateControls(store, { sendBtn, stopBtn, input }) {
   if (sendBtn) sendBtn.classList.toggle("hidden", store.running);
   if (stopBtn) stopBtn.classList.toggle("hidden", !store.running);
   if (input) input.disabled = store.running;
+}
+
+function subAgentCard(s) {
+  const card = el("div", "ag-sub");
+  card.classList.toggle("running", s.status === "running");
+  card.classList.toggle("failed", s.status === "failed");
+  card.classList.toggle("closed", s.status === "closed");
+  const head = el("div", "ag-sub-head");
+  const arrow = el("span", "ag-sub-arrow", s.expanded ? "▾" : "▸");
+  const name = el("span", "ag-sub-name", "子agent · " + s.name);
+  const status = el("span", "ag-sub-status",
+    s.status === "running" ? "运行中…" :
+    s.status === "closed" ? "已关闭" :
+    s.status === "failed" ? ("失败" + (s.reason ? " · " + s.reason : "")) : "完成");
+  head.append(arrow, name, status);
+  card.append(head);
+
+  const body = el("div", "ag-sub-body");
+  if (s.duty) body.append(el("div", "ag-sub-duty", s.duty));
+  for (const t of s.tools) body.append(toolCard(t));
+  const text = (s.lines.join("") + (s.text ? "\n" + s.text : "")).trim();
+  if (text) body.append(el("pre", "ag-sub-out", text));
+  card.append(body);
+
+  const setExpanded = (open) => { card.classList.toggle("expanded", open); arrow.textContent = open ? "▾" : "▸"; };
+  setExpanded(!!s.expanded);
+  head.addEventListener("click", () => { s.expanded = !s.expanded; setExpanded(s.expanded); });
+  return card;
 }

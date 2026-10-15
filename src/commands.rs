@@ -14,6 +14,17 @@ fn save_projects(inner: &crate::state::Inner) -> Result<(), String> {
     inner.projects.save()
 }
 
+fn delete_gap() -> std::time::Duration {
+    let ms = 3000 + {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        nanos % 2001
+    };
+    std::time::Duration::from_millis(ms)
+}
+
 async fn account_guard(
     state: &AppState,
     project_id: &str,
@@ -181,39 +192,103 @@ pub async fn delete_project(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let conv_ids: Vec<String> = {
+    let (main_ids, sub_by_account): (
+        Vec<String>,
+        std::collections::HashMap<String, Vec<String>>,
+    ) = {
         let inner = state.inner.lock().await;
         inner
             .projects
             .project(&id)
-            .map(|p| p.conversations.iter().map(|c| c.id.clone()).collect())
+            .map(|p| {
+                let main: Vec<String> = p.conversations.iter().map(|c| c.id.clone()).collect();
+                let mut by: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for sa in &p.sub_agents {
+                    let acc = if sa.account.is_empty() {
+                        p.account.clone()
+                    } else {
+                        sa.account.clone()
+                    };
+                    for c in &sa.conversations {
+                        if !c.session_id.is_empty() {
+                            by.entry(acc.clone()).or_default().push(c.session_id.clone());
+                        }
+                    }
+                }
+                (main, by)
+            })
             .unwrap_or_default()
     };
-    let total = conv_ids.len();
-    let model = state.ensure_run_ctx(&id).await.ok();
 
-    for (i, cid) in conv_ids.iter().enumerate() {
+    // 取消该项目下所有运行中子 agent，并清理待注入结果与主 turn 取消钩子。
+    {
+        let mut inner = state.inner.lock().await;
+        for r in inner.sub_runs.values() {
+            if r.project_id == id
+                && matches!(
+                    r.status,
+                    crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+                )
+            {
+                r.cancel.cancel();
+            }
+        }
+        if let Some(ctx) = inner.running.get(&id) {
+            if let Some(c) = &ctx.cancel {
+                c.cancel();
+            }
+        }
+        inner.pending_sub_results.remove(&id);
+    }
+
+    let total = main_ids.len() + sub_by_account.values().map(|v| v.len()).sum::<usize>();
+    let mut done = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+
+    let main_model = state.ensure_run_ctx(&id).await.ok();
+
+    for cid in &main_ids {
+        done += 1;
         let _ = app.emit(
             "agent://delete-progress",
-            serde_json::json!({ "phase": "deleting", "current": i + 1, "total": total }),
+            serde_json::json!({ "phase": "deleting", "current": done, "total": total }),
         );
-        if let Some(m) = &model {
-            let _ = m.delete_session(cid).await;
+        if let Some(m) = &main_model {
+            if let Err(e) = m.delete_session(cid).await {
+                failed.push(format!("{cid}: {e}"));
+            }
         }
         {
             let mut inner = state.inner.lock().await;
             let _ = inner.projects.delete_conversation(&id, cid);
             let _ = save_projects(&inner);
         }
-        if i + 1 < total {
-            let ms = 3000 + {
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.subsec_nanos() as u64)
-                    .unwrap_or(0);
-                nanos % 2001
-            };
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        if done < total {
+            tokio::time::sleep(delete_gap()).await;
+        }
+    }
+
+    for (acc, sids) in &sub_by_account {
+        let m = match state.ensure_account_model(acc).await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("删除子对话：账号 {acc} bridge 不可用: {e}");
+                continue;
+            }
+        };
+        for sid in sids {
+            done += 1;
+            let _ = app.emit(
+                "agent://delete-progress",
+                serde_json::json!({ "phase": "deleting", "current": done, "total": total }),
+            );
+            if let Err(e) = m.delete_session(sid).await {
+                failed.push(format!("{sid}: {e}"));
+            }
+            if done < total {
+                tokio::time::sleep(delete_gap()).await;
+            }
         }
     }
 
@@ -226,12 +301,29 @@ pub async fn delete_project(
     inner.projects.delete_project(&id)?;
     save_projects(&inner)?;
     inner.running.remove(&id);
+    // 清理该项目残留的子 agent 运行态与待注入结果。
+    let stale_sub: Vec<(String, String)> = inner
+        .sub_runs
+        .values()
+        .filter(|r| r.project_id == id)
+        .map(|r| (r.account.clone(), r.profile_id.clone()))
+        .collect();
+    inner.sub_runs.retain(|_, r| r.project_id != id);
+    inner.pending_sub_results.remove(&id);
     drop(inner);
+    for (acc, prof) in stale_sub {
+        state.release_sub_bridge(&acc, &prof).await;
+    }
     deepseek_agent::agent::browser::shutdown_key(&id).await;
     let _ = app.emit("agent://projects-changed", ());
     let _ = app.emit(
         "agent://delete-progress",
-        serde_json::json!({ "phase": "done", "current": total, "total": total }),
+        serde_json::json!({
+            "phase": "done",
+            "current": total,
+            "total": total,
+            "failed": failed,
+        }),
     );
     Ok(())
 }
@@ -267,6 +359,237 @@ pub async fn open_project(
     save_projects(&inner)?;
     drop(inner);
     let _ = app.emit("agent://projects-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_sub_agents(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::projects::SubAgent>, String> {
+    let inner = state.inner.lock().await;
+    Ok(inner.projects.sub_agents_of(&project_id))
+}
+
+#[tauri::command]
+pub async fn get_sub_accounts(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let inner = state.inner.lock().await;
+    Ok(inner.projects.sub_accounts_of(&project_id))
+}
+
+#[tauri::command]
+pub async fn set_sub_accounts(
+    project_id: String,
+    accounts: Vec<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut inner = state.inner.lock().await;
+        inner.projects.set_sub_accounts(&project_id, accounts);
+        let _ = inner.projects.save();
+    }
+    let _ = app.emit("agent://projects-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_sub_account_limits(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, u32>, String> {
+    let inner = state.inner.lock().await;
+    Ok(inner.projects.sub_account_limits_of(&project_id))
+}
+
+#[tauri::command]
+pub async fn set_sub_account_limits(
+    project_id: String,
+    limits: std::collections::HashMap<String, u32>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut inner = state.inner.lock().await;
+        inner.projects.set_sub_account_limits(&project_id, limits);
+        let _ = inner.projects.save();
+    }
+    let _ = app.emit("agent://projects-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_sub_candidate_accounts() -> Result<Vec<String>, String> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let mut out = Vec::new();
+    for name in AppState::list_accounts() {
+        let profile = home
+            .join(".deepseek-agent")
+            .join("accounts")
+            .join(&name)
+            .join("browser");
+        let state_json = home
+            .join(".ligong")
+            .join("accounts")
+            .join(&name)
+            .join("state.json");
+        if profile.is_dir() && state_json.is_file() {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn remove_sub_account(
+    project_id: String,
+    account: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // 先取消该项目下该账号的所有运行中子 agent，避免删除后后台任务继续运行。
+    {
+        let inner = state.inner.lock().await;
+        for r in inner.sub_runs.values() {
+            if r.project_id == project_id
+                && r.account == account
+                && matches!(
+                    r.status,
+                    crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+                )
+            {
+                r.cancel.cancel();
+            }
+        }
+    }
+    let sids = {
+        let mut inner = state.inner.lock().await;
+        let mut pool = inner.projects.sub_accounts_of(&project_id);
+        pool.retain(|a| a != &account);
+        inner.projects.set_sub_accounts(&project_id, pool);
+        let sids = inner.projects.remove_sub_agents_by_account(&project_id, &account);
+        let _ = inner.projects.save();
+        sids
+    };
+    if let Ok(model) = state.ensure_account_model(&account).await {
+        for sid in &sids {
+            if !sid.is_empty() {
+                let _ = model.delete_session(sid).await;
+            }
+        }
+    }
+    let keys: Vec<(String, String)> = {
+        let inner = state.inner.lock().await;
+        inner
+            .sub_runs
+            .values()
+            .filter(|r| r.project_id == project_id && r.account == account)
+            .map(|r| (r.account.clone(), r.profile_id.clone()))
+            .collect()
+    };
+    for (acc, pid_profile) in keys {
+        state.release_sub_bridge(&acc, &pid_profile).await;
+    }
+    {
+        let mut inner = state.inner.lock().await;
+        inner
+            .sub_runs
+            .retain(|_, r| !(r.project_id == project_id && r.account == account));
+    }
+    let _ = app.emit(
+        "agent://sub-agents-changed",
+        serde_json::json!({ "project_id": project_id }),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_sub_agent(
+    project_id: String,
+    sub_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let acc = {
+        let inner = state.inner.lock().await;
+        inner
+            .projects
+            .sub_agents_of(&project_id)
+            .into_iter()
+            .find(|s| s.id == sub_id)
+            .map(|s| s.account)
+            .unwrap_or_default()
+    };
+    // 先取消该子 agent 的运行实例。
+    {
+        let inner = state.inner.lock().await;
+        if let Some(r) = inner.sub_runs.get(&sub_id) {
+            if matches!(
+                r.status,
+                crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+            ) {
+                r.cancel.cancel();
+            }
+        }
+    }
+    let sids = {
+        let mut inner = state.inner.lock().await;
+        let sids = inner.projects.remove_sub_agent(&project_id, &sub_id);
+        let _ = inner.projects.save();
+        sids
+    };
+    if !acc.is_empty() {
+        if let Ok(model) = state.ensure_account_model(&acc).await {
+            for sid in &sids {
+                let _ = model.delete_session(sid).await;
+            }
+        }
+    } else if let Ok(model) = state.ensure_run_ctx(&project_id).await {
+        for sid in &sids {
+            let _ = model.delete_session(sid).await;
+        }
+    }
+    let _ = app.emit("agent://sub-agents-changed", serde_json::json!({ "project_id": project_id }));
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_sub_agent_conv(
+    project_id: String,
+    sub_id: String,
+    session_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let acc = {
+        let inner = state.inner.lock().await;
+        inner
+            .projects
+            .sub_agents_of(&project_id)
+            .into_iter()
+            .find(|s| s.id == sub_id)
+            .map(|s| s.account)
+            .unwrap_or_default()
+    };
+    let removed = {
+        let mut inner = state.inner.lock().await;
+        let r = inner.projects.remove_sub_conv(&project_id, &sub_id, &session_id);
+        let _ = inner.projects.save();
+        r
+    };
+    if let Some(sid) = removed {
+        if !acc.is_empty() {
+            if let Ok(model) = state.ensure_account_model(&acc).await {
+                let _ = model.delete_session(&sid).await;
+            }
+        } else if let Ok(model) = state.ensure_run_ctx(&project_id).await {
+            let _ = model.delete_session(&sid).await;
+        }
+    }
+    let _ = app.emit("agent://sub-agents-changed", serde_json::json!({ "project_id": project_id }));
     Ok(())
 }
 
@@ -412,6 +735,14 @@ pub async fn load_project_messages(
 
 #[tauri::command]
 pub async fn send_message(project_id: String, text: String, app: AppHandle) -> Result<(), String> {
+    start_turn(app, project_id, text).await
+}
+
+pub async fn start_turn(
+    app: AppHandle,
+    project_id: String,
+    text: String,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     {
         let inner = state.inner.lock().await;
@@ -421,36 +752,84 @@ pub async fn send_message(project_id: String, text: String, app: AppHandle) -> R
             .ok_or("请先选择一个项目")?;
     }
     let model = state.ensure_run_ctx(&project_id).await?;
-    let cancel = {
+    let (cancel, my_gen) = {
         let mut inner = state.inner.lock().await;
         let ctx = inner.running.get_mut(&project_id).ok_or("运行上下文丢失")?;
-        if ctx.busy {
+        if ctx.turn_active {
             return Err("该项目正在处理中".into());
         }
         ctx.busy = true;
+        ctx.turn_active = true;
+        ctx.turn_gen = ctx.turn_gen.wrapping_add(1);
         let c = CancellationToken::new();
         ctx.cancel = Some(c.clone());
-        c
+        (c, ctx.turn_gen)
     };
     let app2 = app.clone();
     let pid = project_id.clone();
     tauri::async_runtime::spawn(async move {
         let state = app2.state::<AppState>();
         let model: std::sync::Arc<dyn Model> = model;
-        let result = runner::run_turn(
-            app2.clone(),
-            state.inner(),
-            pid.clone(),
-            model,
-            text,
-            cancel,
-        )
-        .await;
-        {
+        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> =
+            Box::pin(runner::run_turn(
+                app2.clone(),
+                state.inner(),
+                pid.clone(),
+                model,
+                text,
+                cancel,
+            ));
+        let result = fut.await;
+        // 只有当代主 turn 才有权收尾：若已被新 turn 取代（generation 不匹配），
+        // 不得清理新 turn 的状态、也不得消费其 pending。
+        let (pending, still_busy, is_current) = {
             let mut inner = state.inner.lock().await;
+            let has_running_sub = inner.sub_runs.values().any(|r| {
+                r.project_id == pid
+                    && matches!(
+                        r.status,
+                        crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+                    )
+            });
+            let mut is_current = false;
             if let Some(ctx) = inner.running.get_mut(&pid) {
-                ctx.busy = false;
-                ctx.cancel = None;
+                if ctx.turn_gen == my_gen {
+                    is_current = true;
+                    ctx.cancel = None;
+                    ctx.turn_active = false;
+                    ctx.busy = has_running_sub;
+                }
+            }
+            let pending = if is_current {
+                inner.pending_sub_results.remove(&pid).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (pending, has_running_sub, is_current)
+        };
+        if !is_current {
+            // 已被新 turn 接管：本次只结束，不再改状态、不再注入。
+            return;
+        }
+        let _ = app2.emit(
+            "agent://project-busy",
+            serde_json::json!({ "id": pid, "busy": still_busy }),
+        );
+        if !pending.is_empty() {
+            let mut block = String::new();
+            for r in pending {
+                block.push_str(&format!(
+                    "\n<sub_agent_result name=\"{}\" ok=\"{}\">\n{}\n</sub_agent_result>\n",
+                    r.name, r.ok, r.text
+                ));
+            }
+            block.push_str(&format!("\n{}\n", runner::SUB_REVIEW_PROMPT));
+            let f = {
+                let inner = state.inner.lock().await;
+                inner.start_turn.clone()
+            };
+            if let Some(f) = f {
+                let _ = f(app2.clone(), pid.clone(), block).await;
             }
         }
         match result {
@@ -495,6 +874,21 @@ pub async fn interrupt(project_id: String, state: State<'_, AppState>) -> Result
     if let Some(m) = model {
         m.stop().await;
     }
+    {
+        let inner = state.inner.lock().await;
+        for r in inner.sub_runs.values() {
+            if r.project_id == project_id
+                && matches!(
+                    r.status,
+                    crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+                )
+            {
+                r.cancel.cancel();
+            }
+        }
+    }
+    // 不在此处修改 turn_active / cancel：由 run_turn 收尾回调（校验 generation）统一清理，
+    // 避免旧 turn 尚未退出时就允许新 turn 启动，导致两个主 turn 并存。
     Ok(())
 }
 

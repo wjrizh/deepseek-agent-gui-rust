@@ -340,7 +340,10 @@ listen("agent://done", (e) => {
     v.currentAssistant = null; v.currentAssistantText = ""; v.currentThinking = null;
   }
   if (project_id === activeProjectId) {
-    setRunning(false);
+    // 主 agent 本轮结束；若仍有子 agent 在跑，保持"停止"可用。
+    invoke("busy_projects").then((busy) => {
+      setRunning(Array.isArray(busy) && busy.includes(project_id));
+    }).catch(() => setRunning(false));
     pendingFiles = [];
     renderFileChips();
   }
@@ -982,6 +985,7 @@ const settingsDelete = document.getElementById("settings-delete");
 const settingsClearHistory = document.getElementById("settings-clear-history");
 const settingsConvCount = document.getElementById("settings-conv-count");
 const settingsConvList = document.getElementById("settings-conv-list");
+const settingsSubList = document.getElementById("settings-sub-list");
 
 let settingsProjectId = null;
 let settingsProjectName = null;
@@ -1005,6 +1009,8 @@ async function renderConversations() {
   catch { convs = []; }
   settingsConvCount.textContent = convs.length;
   settingsConvList.innerHTML = "";
+  await renderSubAgents();
+  await renderSubAccounts();
   if (!convs.length) {
     const empty = document.createElement("div");
     empty.className = "conv-empty";
@@ -1061,6 +1067,208 @@ async function renderConversations() {
       });
     };
     settingsConvList.appendChild(row);
+  });
+}
+
+async function renderSubAccounts() {
+  const host = document.getElementById("settings-sub-accounts");
+  if (!host) return;
+  let candidates = [];
+  try { candidates = await invoke("list_sub_candidate_accounts"); } catch { candidates = []; }
+  let order = [];
+  try { order = await invoke("get_sub_accounts", { projectId: settingsProjectId }); } catch { order = []; }
+  let limits = {};
+  try { limits = await invoke("get_sub_account_limits", { projectId: settingsProjectId }); } catch { limits = {}; }
+  let projectAccount = "";
+  try {
+    const p = (await invoke("list_projects")).find((x) => x.id === settingsProjectId);
+    projectAccount = p ? p.account : "";
+  } catch {}
+
+  if (projectAccount && !order.includes(projectAccount)) order.push(projectAccount);
+  order = order.filter((a) => a === projectAccount || candidates.includes(a));
+
+  host.innerHTML = "";
+  const othersSum = order.filter((a) => a !== projectAccount).reduce((s, a) => s + (limits[a] || 0), 0);
+  const mainLimit = Math.max(0, 3 - othersSum);
+
+  const list = document.createElement("div");
+  list.className = "sub-acc-list";
+  host.appendChild(list);
+
+  const saveAll = async () => {
+    const rows = [...list.querySelectorAll(".sub-acc-row")];
+    const newOrder = rows.map((r) => r.dataset.acc).filter((a) => a);
+    const newLimits = {};
+    for (const r of rows) {
+      const a = r.dataset.acc;
+      if (!a || a === projectAccount) continue;
+      const n = r.querySelector("input[type=number]");
+      newLimits[a] = n ? Math.max(0, parseInt(n.value || "0", 10) || 0) : 0;
+    }
+    try {
+      await invoke("set_sub_accounts", { projectId: settingsProjectId, accounts: newOrder });
+      await invoke("set_sub_account_limits", { projectId: settingsProjectId, limits: newLimits });
+      await renderSubAccounts();
+    } catch (e) { iosToast("保存失败：" + (e && e.message ? e.message : e)); }
+  };
+
+  order.forEach((acc) => {
+    const isMain = acc === projectAccount;
+    const row = document.createElement("div");
+    row.className = "sub-acc-row";
+    row.dataset.acc = acc;
+
+    const handle = document.createElement("span");
+    handle.className = "sub-acc-handle"; handle.textContent = "⠿";
+    handle.draggable = true;
+
+    const name = document.createElement("span");
+    name.className = "sub-acc-name";
+    name.textContent = acc;
+
+    const tag = document.createElement("span");
+    tag.className = "sub-acc-tag";
+    tag.textContent = isMain ? "主账号" : "";
+
+    const num = document.createElement("input");
+    num.type = "number"; num.min = "0"; num.className = "sub-acc-num";
+    num.value = isMain ? mainLimit : (limits[acc] || 0);
+    num.disabled = isMain;
+    num.title = "该账号可同时运行的子 Agent 上限";
+    num.onchange = saveAll;
+    row.append(handle, name, tag, num);
+
+    if (!isMain) {
+      const del = document.createElement("button");
+      del.className = "sub-acc-rm"; del.textContent = "✕";
+      del.title = "从池移除（删该账号在本项目的子 Agent）";
+      del.onclick = async () => {
+        if (!confirm("从本项目移除子 Agent 账号「" + acc + "」？\n将删除该账号在本项目创建的所有子 Agent 与其云端对话。\n全局账号不受影响。")) return;
+        try {
+          await invoke("remove_sub_account", { projectId: settingsProjectId, account: acc });
+          await renderSubAccounts();
+          await renderSubAgents();
+        } catch (e) { iosToast("移除失败：" + e); }
+      };
+      row.appendChild(del);
+    }
+    list.appendChild(row);
+  });
+
+  // 拖动排序：pointer 事件（Tauri webview 原生 DnD 不可靠）
+  let dragRow = null, dragging = false;
+  list.querySelectorAll(".sub-acc-handle").forEach((h) => {
+    h.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      dragRow = h.closest(".sub-acc-row");
+      if (!dragRow) return;
+      dragRow.classList.add("dragging");
+      dragging = true;
+      try { h.setPointerCapture(e.pointerId); } catch {}
+    });
+    h.addEventListener("pointermove", (e) => {
+      if (!dragging || !dragRow) return;
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      const target = el && el.closest ? el.closest(".sub-acc-row") : null;
+      if (!target || target === dragRow || !list.contains(target)) return;
+      const rect = target.getBoundingClientRect();
+      const after = e.clientY > rect.top + rect.height / 2;
+      list.insertBefore(dragRow, after ? target.nextSibling : target);
+    });
+    const endDrag = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      if (dragRow) dragRow.classList.remove("dragging");
+      dragRow = null;
+      try { h.releasePointerCapture(e.pointerId); } catch {}
+      saveAll();
+    };
+    h.addEventListener("pointerup", endDrag);
+    h.addEventListener("pointercancel", endDrag);
+  });
+
+  // 候选未加入：小按钮
+  const rest = candidates.filter((a) => !order.includes(a));
+  if (rest.length) {
+    const addWrap = document.createElement("div");
+    addWrap.className = "sub-acc-addwrap";
+    for (const acc of rest) {
+      const chip = document.createElement("button");
+      chip.className = "sub-acc-addbtn";
+      chip.textContent = "＋ " + acc;
+      chip.onclick = async () => {
+        try {
+          await invoke("set_sub_accounts", { projectId: settingsProjectId, accounts: [...order, acc] });
+          await renderSubAccounts();
+        } catch (e) { iosToast("加入失败：" + e); }
+      };
+      addWrap.appendChild(chip);
+    }
+    host.appendChild(addWrap);
+  }
+}
+
+async function renderSubAgents() {
+  if (!settingsSubList) return;
+  let subs = [];
+  try { subs = await invoke("list_sub_agents", { projectId: settingsProjectId }); }
+  catch { subs = []; }
+  settingsSubList.innerHTML = "";
+  if (!subs.length) {
+    const empty = document.createElement("div");
+    empty.className = "conv-empty";
+    empty.textContent = "暂无子 Agent。";
+    settingsSubList.appendChild(empty);
+    return;
+  }
+  subs.forEach((sa) => {
+    const head = document.createElement("div");
+    head.className = "sub-head";
+    const dutyText = (sa.duty && sa.duty !== sa.name) ? sa.duty : "";
+    head.innerHTML =
+      '<span class="sub-name">' + escapeHtml(sa.name) + '</span>' +
+      '<span class="sub-duty">' + escapeHtml(dutyText) + '</span>' +
+      '<button class="sub-del" title="删除该子 Agent（删除其全部对话与云端会话）">' +
+        '<svg viewBox="0 0 24 24" width="13" height="13"><path d="M6 7h12M9 7V5h6v2M8 7l1 12h6l1-12" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+      '</button>';
+    head.querySelector(".sub-del").onclick = (ev) => {
+      ev.stopPropagation();
+      inlineConfirm(head, "删除子 Agent「" + escapeHtml(sa.name) + "」及其全部对话？", async () => {
+        const ov = showDeletingOverlay("删除中…");
+        try {
+          await invoke("delete_sub_agent", { projectId: settingsProjectId, subId: sa.id });
+          await renderSubAgents();
+        } catch (e) { iosToast("删除子 Agent 失败：" + e); }
+        finally { ov.close(); }
+      });
+    };
+    settingsSubList.appendChild(head);
+
+    (sa.conversations || []).forEach((c, i) => {
+      const row = document.createElement("div");
+      row.className = "conv-item sub-conv" + (c.is_active ? " active" : "");
+      row.innerHTML =
+        '<span class="conv-box">' + (c.is_active ? "●" : "○") + '</span>' +
+        '<span class="conv-title">' + ("对话" + (i + 1)) + '</span>' +
+        '<button class="conv-del" title="删除该子对话（同时删除云端会话）">' +
+          '<svg viewBox="0 0 24 24" width="13" height="13"><path d="M6 7h12M9 7V5h6v2M8 7l1 12h6l1-12" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+        '</button>';
+      row.querySelector(".conv-del").onclick = (ev) => {
+        ev.stopPropagation();
+        inlineConfirm(row, "删除该子对话？", async () => {
+          const ov = showDeletingOverlay("删除中…");
+          try {
+            await invoke("delete_sub_agent_conv", {
+              projectId: settingsProjectId, subId: sa.id, sessionId: c.session_id,
+            });
+            await renderSubAgents();
+          } catch (e) { iosToast("删除子对话失败：" + e); }
+          finally { ov.close(); }
+        });
+      };
+      settingsSubList.appendChild(row);
+    });
   });
 }
 

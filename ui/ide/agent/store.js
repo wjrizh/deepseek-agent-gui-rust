@@ -9,6 +9,8 @@ export function createStore(projectId) {
     curAssistant: null,    // 当前流式助手消息对象（引用 messages 中一项）
     curTool: null,         // 当前工具卡片数据对象
     toolByCallId: new Map(),
+    subAgents: new Map(),
+    subToolById: new Map(),
     listeners: new Set(),
 
     subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); },
@@ -92,6 +94,56 @@ export function createStore(projectId) {
       this.running = false;
       this.messages.push({ role: "notice", text: "⚠ " + (message || "未知错误") });
       this.emitChange();
+    },
+
+    subStart(id, name, duty) {
+      if (!id) return;
+      let s = this.subAgents.get(id);
+      if (!s) { s = { id, name: name || id, duty: duty || "", status: "running", ok: null, reason: null, text: "", lines: [], tools: [] }; this.subAgents.set(id, s); }
+      s.name = name || s.name; s.duty = duty || s.duty; s.status = "running";
+      this.emitChange();
+    },
+    subDelta(id, name, text) {
+      if (!id) return;
+      let s = this.subAgents.get(id);
+      if (!s) { s = { id, name: name || id, duty: "", status: "running", ok: null, reason: null, text: "", lines: [], tools: [] }; this.subAgents.set(id, s); }
+      s.lines.push(text || "");
+      this.emitChange();
+    },
+    subTool(id, name, phase, callId, command, output, ms, error) {
+      if (!id) return;
+      let s = this.subAgents.get(id);
+      if (!s) { s = { id, name: name || id, duty: "", status: "running", ok: null, reason: null, text: "", lines: [], tools: [] }; this.subAgents.set(id, s); }
+      const key = id + ":" + callId;
+      if (phase === "call") {
+        const card = { role: "tool", name: name || "tool", command: command || "", output: "", done: false, error: false };
+        this.subToolById.set(key, card); s.tools.push(card);
+      } else if (phase === "output") {
+        let card = this.subToolById.get(key);
+        if (!card) { card = { role: "tool", name: name || "tool", command: "", output: "", done: false, error: false }; this.subToolById.set(key, card); s.tools.push(card); }
+        card.output += output || "";
+      } else if (phase === "done") {
+        const card = this.subToolById.get(key);
+        if (card) { card.done = true; card.error = !!error; card.ms = ms || 0; }
+      }
+      this.emitChange();
+    },
+    subDone(id, name, ok, reason, result) {
+      if (!id) return;
+      let s = this.subAgents.get(id);
+      if (!s) { s = { id, name: name || id, duty: "", status: "done", ok: null, reason: null, text: "", lines: [], tools: [] }; this.subAgents.set(id, s); }
+      s.status = ok ? "done" : "failed";
+      s.ok = !!ok; s.reason = reason || null; s.text = result || "";
+      this.emitChange();
+    },
+    subClose(id, name) {
+      const s = id ? this.subAgents.get(id) : [...this.subAgents.values()].find((x) => x.name === name);
+      if (s) { s.status = "closed"; this.emitChange(); }
+    },
+    subCountText() {
+      let total = 0, running = 0;
+      for (const s of this.subAgents.values()) { total++; if (s.status === "running") running++; }
+      return { total, running };
     },
 
     setRunning(on) {

@@ -57,6 +57,7 @@ async function init() {
   log('chromium launched');
 
   let injected = false;
+  let origins = [];
   const stateFile = process.env.LIGONG_STATE_FILE;
   if (stateFile && fs.existsSync(stateFile)) {
     try {
@@ -66,7 +67,24 @@ async function init() {
         injected = true;
         log('injected cookies:', state.cookies.length);
       }
+      if (Array.isArray(state.origins)) origins = state.origins;
     } catch (e) { log('state inject failed:', String((e && e.message) || e)); }
+  }
+
+  // 子 bridge：在任何页面脚本执行前注入 localStorage，避免闪登录页。
+  if (process.env.LIGONG_INJECT_STATE === '1' && origins.length) {
+    const initData = origins.filter((o) => o.origin && Array.isArray(o.localStorage));
+    await context.addInitScript((data) => {
+      for (const o of data) {
+        try {
+          if (window.location.origin === new URL(o.origin).origin) {
+            for (const it of o.localStorage) {
+              try { window.localStorage.setItem(it.name, it.value); } catch {}
+            }
+          }
+        } catch {}
+      }
+    }, initData);
   }
 
   const pages = context.pages();
@@ -87,10 +105,26 @@ async function init() {
 
   log('navigating to chat.deepseek.com');
   await page.goto('https://chat.deepseek.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  log('navigated, url=', page.url());
-  if (injected) {
+  if (process.env.LIGONG_INJECT_STATE === '1') {
+    // 仅子 bridge：用 state.json 注入 localStorage（DeepSeek 登录态在 userToken/settingsJwt 等）。
+    for (const o of origins) {
+      if (!o.origin || !Array.isArray(o.localStorage)) continue;
+      try {
+        await page.goto(o.origin, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.evaluate((items) => {
+          for (const it of items) {
+            try { window.localStorage.setItem(it.name, it.value); } catch {}
+          }
+        }, o.localStorage);
+        log('injected localStorage:', o.origin, o.localStorage.length);
+      } catch (e) { log('localStorage inject failed:', o.origin, String((e && e.message) || e)); }
+    }
+    await page.goto('https://chat.deepseek.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+  } else if (injected) {
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
   }
+  log('navigated, url=', page.url());
   try {
     await page.waitForSelector('textarea', { timeout: 30000 });
   } catch {
@@ -543,6 +577,11 @@ rl.on("line", (line) => {
   rid = req.req_id !== undefined ? req.req_id : null;
   if (req.toggles) {
     void handleToggle(req);
+    return;
+  }
+  // stop 走独立即时通道：不进串行队列，否则会排在在途 ask 后面，无法中断生成。
+  if (req.stop) {
+    stopRequested = true;
     return;
   }
   enqueue(() => handleSerial(req, rid));

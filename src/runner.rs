@@ -24,14 +24,14 @@ enum AnswerStreamState {
     ToolBuffer,
 }
 
-struct AnswerStreamGate {
+pub(crate) struct AnswerStreamGate {
     state: AnswerStreamState,
     buf: String,
     sent: usize,
 }
 
 impl AnswerStreamGate {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: AnswerStreamState::Normal,
             buf: String::new(),
@@ -39,7 +39,7 @@ impl AnswerStreamGate {
         }
     }
 
-    fn push(&mut self, text: &str) -> Vec<String> {
+    pub(crate) fn push(&mut self, text: &str) -> Vec<String> {
         self.buf.push_str(text);
         match self.state {
             AnswerStreamState::Normal => self.handle_normal(),
@@ -48,7 +48,7 @@ impl AnswerStreamGate {
         }
     }
 
-    fn finish_text(&mut self) -> Option<String> {
+    pub(crate) fn finish_text(&mut self) -> Option<String> {
         if self.sent >= self.buf.len() {
             self.state = AnswerStreamState::Normal;
             return None;
@@ -151,7 +151,7 @@ fn compact_for_match(text: &str) -> (String, Vec<usize>) {
     (s, out_map)
 }
 
-fn find_tool_marker(text: &str) -> Option<usize> {
+pub(crate) fn find_tool_marker(text: &str) -> Option<usize> {
     let (compact, map) = compact_for_match(text);
     TOOL_MARKERS
         .iter()
@@ -162,7 +162,7 @@ fn find_tool_marker(text: &str) -> Option<usize> {
         .min()
 }
 
-fn ends_with_tool_prefix(text: &str) -> bool {
+pub(crate) fn ends_with_tool_prefix(text: &str) -> bool {
     let (compact, _) = compact_for_match(text);
     TOOL_MARKERS.iter().any(|marker| {
         let (mcompact, _) = compact_for_match(marker);
@@ -173,15 +173,17 @@ fn ends_with_tool_prefix(text: &str) -> bool {
 
 
 
-const REPORT_PROMPT: &str = "请对本次对话做一份工作交接报告，用中文输出，包含以下部分：\n1. 任务目标\n2. 已完成的工作与产出\n3. 积累的经验/结论\n4. 尚未解决的问题\n5. 接下来要解决的问题\n只输出报告本身，不要客套。";
+pub(crate) const REPORT_PROMPT: &str = "请对本次对话做一份工作交接报告，用中文输出，包含以下部分：\n1. 任务目标\n2. 已完成的工作与产出\n3. 积累的经验/结论\n4. 尚未解决的问题\n5. 接下来要解决的问题\n只输出报告本身，不要客套。";
 
-const HANDOFF_INTRO: &str = "以下是从上一会话交接过来的工作进度报告。请先确认收到这份报告，然后我们继续。\n\n===== 交接报告开始 =====\n";
+pub(crate) const HANDOFF_INTRO: &str = "以下是从上一会话交接过来的工作进度报告。请先确认收到这份报告，然后我们继续。\n\n===== 交接报告开始 =====\n";
+
+pub(crate) const SUB_REVIEW_PROMPT: &str = "以下是子 agent 的完成结果。请审阅：若合格，简要说明并继续；若异常（幻觉/不完整/格式错/中断），用同名 sub_agent 重试（最多 3 次）；3 次仍失败则给出可执行的解决方案。";
 
 const SEND_DELAY_BASE: Duration = Duration::from_secs(7);
 const SEND_DELAY_JITTER_MS: u64 = 4000;
 const GLOBAL_REQUEST_GAP: Duration = Duration::from_secs(10);
 
-async fn send_delay(cancel: &CancellationToken) {
+pub(crate) async fn send_delay(cancel: &CancellationToken) {
     let jitter = {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -351,6 +353,57 @@ async fn session_id_of(state: &AppState, project_id: &str) -> Option<String> {
     inner.projects.active_conversation_of(project_id)
 }
 
+#[derive(Clone)]
+pub struct EmitCtx {
+    pub app: AppHandle,
+    pub project_id: String,
+    pub sub_id: Option<String>,
+    pub sub_name: Option<String>,
+}
+
+impl EmitCtx {
+    pub fn main(app: &AppHandle, project_id: &str) -> Self {
+        Self {
+            app: app.clone(),
+            project_id: project_id.to_string(),
+            sub_id: None,
+            sub_name: None,
+        }
+    }
+
+    pub fn delta(&self, kind: &str, text: &str) {
+        let mut v = serde_json::json!({
+            "project_id": self.project_id,
+            "kind": kind,
+            "text": text,
+        });
+        if let Some(sid) = &self.sub_id {
+            v["sub_id"] = serde_json::json!(sid);
+            v["sub_name"] = serde_json::json!(self.sub_name.clone().unwrap_or_default());
+        }
+        let _ = self.app.emit("agent://delta", v);
+    }
+
+    pub fn tool(&self, payload: serde_json::Value) {
+        let mut v = payload;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("project_id".into(), serde_json::json!(self.project_id));
+            if let Some(sid) = &self.sub_id {
+                obj.insert("sub_id".into(), serde_json::json!(sid));
+                obj.insert("sub_name".into(), serde_json::json!(self.sub_name.clone().unwrap_or_default()));
+            }
+        }
+        let _ = self.app.emit("agent://tool", v);
+    }
+
+    pub fn retry(&self, reason: &str) {
+        let _ = self.app.emit(
+            "agent://retry",
+            serde_json::json!({ "project_id": self.project_id, "reason": reason }),
+        );
+    }
+}
+
 pub async fn run_turn(
     app: AppHandle,
     state: &AppState,
@@ -393,8 +446,6 @@ pub async fn run_turn(
         let inner = state.inner.lock().await;
         inner.running.get(&project_id).map(|c| c.account.clone())
     }.unwrap_or_default();
-    let account_mutex = state.account_lock(&account).await;
-    let _account_guard = account_mutex.lock().await;
     {
         let mut inner = state.inner.lock().await;
         let registered = inner
@@ -465,6 +516,9 @@ pub async fn run_turn(
         }
     };
 
+    let ec = EmitCtx::main(&app, &project_id);
+
+    let mut format_retries: u32 = 0;
     loop {
         {
             let n = model
@@ -486,7 +540,7 @@ pub async fn run_turn(
                 };
                 let mut report_req = CompletionReq::new(session_id.clone(), REPORT_PROMPT.to_string());
                 report_req.parent_message_id = parent;
-                if !state.throttle(GLOBAL_REQUEST_GAP, &cancel).await {
+                if !state.throttle_account(&account, GLOBAL_REQUEST_GAP, &cancel).await {
                     return Ok(());
                 }
                 let report = {
@@ -535,6 +589,36 @@ pub async fn run_turn(
                 ctx.session.search,
             )
         };
+
+        // 每轮都带上当前项目子 agent 状态。
+        {
+            let sub_status = {
+                let inner = state.inner.lock().await;
+                let subs = inner.projects.sub_agents_of(&project_id);
+                if subs.is_empty() {
+                    String::new()
+                } else {
+                    let mut parts = Vec::new();
+                    let mut running = 0usize;
+                    for sa in &subs {
+                        let st = match inner.sub_runs.get(&sa.id).map(|r| &r.status) {
+                            Some(crate::state::SubRunStatus::Running)
+                            | Some(crate::state::SubRunStatus::Starting) => { running += 1; "运行中" }
+                            Some(crate::state::SubRunStatus::Succeeded) => "完成",
+                            Some(crate::state::SubRunStatus::Failed) => "失败",
+                            Some(crate::state::SubRunStatus::Cancelled) => "已取消",
+                            Some(crate::state::SubRunStatus::Closed) => "已关闭",
+                            None => "空闲",
+                        };
+                        parts.push(format!("{}（{}）", sa.name, st));
+                    }
+                    format!("\n[系统] 本项目子agent：共 {}（运行 {}）—— {}\n", subs.len(), running, parts.join("、"))
+                }
+            };
+            if !sub_status.is_empty() {
+                next_prompt.push_str(&sub_status);
+            }
+        }
 
         let mut req = CompletionReq::new(session_id.clone(), next_prompt.clone());
         req.parent_message_id = parent;
@@ -593,7 +677,7 @@ pub async fn run_turn(
             }
         };
 
-        if !state.throttle(GLOBAL_REQUEST_GAP, &cancel).await {
+        if !state.throttle_account(&account, GLOBAL_REQUEST_GAP, &cancel).await {
             return Ok(());
         }
         let mut reply = tokio::select! {
@@ -616,9 +700,9 @@ pub async fn run_turn(
             }
         }
         if reply.content.trim().is_empty() {
-            let _ = app.emit("agent://retry", serde_json::json!({ "project_id": project_id, "reason": "empty" }));
+            ec.retry("empty");
             let mut noop = |_: DeltaKind, _: &str| {};
-            if !state.throttle(GLOBAL_REQUEST_GAP, &cancel).await {
+            if !state.throttle_account(&account, GLOBAL_REQUEST_GAP, &cancel).await {
                 return Ok(());
             }
             reply = tokio::select! {
@@ -646,7 +730,6 @@ pub async fn run_turn(
                 let _ = inner.projects.save();
                 session_id = real_sid.clone();
                 let _ = app.emit("agent://projects-changed", ());
-                let _ = crate::projects::append_message(&session_id, "user", &input);
             }
         }
         if reply.message_id.is_some() {
@@ -668,6 +751,16 @@ pub async fn run_turn(
         let __po = parser::parse(&reply.content);
         match __po {
             ParseOutcome::Text(text) => {
+                // 先把 gate 中可能缓冲的尾部 flush（避免以工具前缀开头的正文被吞）。
+                {
+                    let tail = answer_gate.lock().unwrap().finish_text();
+                    if let Some(t) = tail {
+                        let _ = app.emit(
+                            "agent://delta",
+                            serde_json::json!({ "project_id": project_id, "kind": "answer", "text": t }),
+                        );
+                    }
+                }
                 let cleaned = text.trim().to_string();
                 if !cleaned.is_empty() {
                     let _ = crate::projects::append_message(&session_id, "assistant", &cleaned);
@@ -701,48 +794,50 @@ pub async fn run_turn(
                             .cloned()
                             .unwrap_or_default(),
                     };
-                    let _ = app.emit(
-                        "agent://tool",
-                        serde_json::json!({
-                            "project_id": project_id,
-                            "phase": "call",
-                            "call_id": call_id,
-                            "name": call.name,
-                            "command": command,
-                        }),
-                    );
+                    ec.tool(serde_json::json!({
+                        "phase": "call",
+                        "call_id": call_id,
+                        "name": call.name,
+                        "command": command,
+                    }));
                     let started = std::time::Instant::now();
-                    let output = execute_tool(&app, state, &model, &project_id, &call, &cancel).await;
+                    let output = dispatch_tool(&app, state, &model, &project_id, &call, &cancel).await;
                     let ms = started.elapsed().as_millis() as u64;
                     let (ok, body) = match output {
                         Ok(out) => (true, out),
                         Err(err) => (false, err),
                     };
                     if call.name != "execute_command" && !body.is_empty() {
-                        let _ = app.emit(
-                            "agent://tool",
-                            serde_json::json!({
-                                "project_id": project_id,
-                                "phase": "output",
-                                "call_id": call_id,
-                                "name": call.name,
-                                "output": &body,
-                            }),
-                        );
-                    }
-                    let _ = app.emit(
-                        "agent://tool",
-                        serde_json::json!({
-                            "project_id": project_id,
-                            "phase": "done",
+                        ec.tool(serde_json::json!({
+                            "phase": "output",
                             "call_id": call_id,
                             "name": call.name,
-                            "ms": ms,
-                            "error": !ok,
-                        }),
-                    );
+                            "output": &body,
+                        }));
+                    }
+                    ec.tool(serde_json::json!({
+                        "phase": "done",
+                        "call_id": call_id,
+                        "name": call.name,
+                        "ms": ms,
+                        "error": !ok,
+                    }));
                     let _ = crate::projects::append_tool(&session_id, &call.name, &command, &body, ms, !ok);
                     results.push_str(&format!("<tool_result name=\"{}\">\n{}\n</tool_result>\n", call.name, body));
+                }
+                let drained = {
+                    let mut inner = state.inner.lock().await;
+                    inner.pending_sub_results.remove(&project_id).unwrap_or_default()
+                };
+                let has_pending = !drained.is_empty();
+                for r in drained {
+                    results.push_str(&format!(
+                        "\n<sub_agent_result name=\"{}\" ok=\"{}\">\n{}\n</sub_agent_result>\n",
+                        r.name, r.ok, r.text
+                    ));
+                }
+                if has_pending {
+                    results.push_str(&format!("\n{}\n", SUB_REVIEW_PROMPT));
                 }
                 next_prompt = results;
                 continue;
@@ -753,6 +848,14 @@ pub async fn run_turn(
                     "agent://format-error",
                     serde_json::json!({ "project_id": project_id, "reason": reason }),
                 );
+                format_retries += 1;
+                if format_retries > 3 {
+                    let _ = app.emit("agent://error", serde_json::json!({
+                        "project_id": project_id,
+                        "message": "模型连续多次输出格式错误，已停止本轮",
+                    }));
+                    return Ok(());
+                }
                 next_prompt = format!("{FORMAT_ERROR_PROMPT}\n\n（解析失败原因：{reason}）");
                 continue;
             }
@@ -766,6 +869,14 @@ pub async fn run_turn(
                         "marker_count": marker_count,
                     }),
                 );
+                format_retries += 1;
+                if format_retries > 3 {
+                    let _ = app.emit("agent://error", serde_json::json!({
+                        "project_id": project_id,
+                        "message": "模型连续多次输出格式错误，已停止本轮",
+                    }));
+                    return Ok(());
+                }
                 next_prompt = format!(
                     "{DSML_ERROR_PROMPT}\n\n（检测到 {marker_count} 个工具标记，解析失败原因：{reason}）"
                 );
@@ -775,7 +886,7 @@ pub async fn run_turn(
     }
 }
 
-async fn refresh_message_count(
+pub(crate) async fn refresh_message_count(
     app: &AppHandle,
     state: &AppState,
     model: &Arc<dyn Model>,
@@ -794,7 +905,7 @@ async fn refresh_message_count(
     let _ = app.emit("agent://projects-changed", ());
 }
 
-fn resolve_tool_path(
+pub(crate) fn resolve_tool_path(
     params: &std::collections::HashMap<String, String>,
     cwd: &std::path::Path,
 ) -> Result<std::path::PathBuf, ()> {
@@ -808,7 +919,23 @@ fn resolve_tool_path(
     Ok(if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) })
 }
 
-async fn execute_tool(
+/// 主 agent 工具分派：含子 agent 三工具；子 agent 循环只走 `execute_tool`（不含此三工具），
+/// 以避免 `run_subagent → agent_loop → execute_tool → run_sub_agent_tool` 的异步递归环。
+pub(crate) async fn dispatch_tool(
+    app: &AppHandle,
+    state: &AppState,
+    model: &Arc<dyn Model>,
+    project_id: &str,
+    call: &deepseek_agent::agent::parser::ToolCall,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    if call.name.as_str() == "sub_agent" {
+        return run_sub_agent_tool(app, state, project_id, call, cancel).await;
+    }
+    execute_tool(app, state, model, project_id, call, cancel).await
+}
+
+pub(crate) async fn execute_tool(
     app: &AppHandle,
     state: &AppState,
     model: &Arc<dyn Model>,
@@ -989,6 +1116,58 @@ async fn execute_tool(
     tool.call(&call.params, false, &mut on_output)
         .await
         .map_err(|e| e.to_string())
+}
+
+async fn run_sub_agent_tool(
+    app: &AppHandle,
+    state: &AppState,
+    project_id: &str,
+    call: &deepseek_agent::agent::parser::ToolCall,
+    _cancel: &CancellationToken,
+) -> Result<String, String> {
+    match call.name.as_str() {
+        "sub_agent" => {
+            let name = call.params.get("name").map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or("sub_agent: 缺少 name（子 agent 名字/职责）")?;
+            let task = call.params.get("task").cloned().unwrap_or_default();
+            if task.trim().is_empty() {
+                return Err("sub_agent: 缺少 task".into());
+            }
+            let duty = call.params.get("duty").cloned().unwrap_or_else(|| name.clone());
+            let agent_type = call.params.get("agent_type").cloned().unwrap_or_else(|| "general".into());
+
+            {
+                let inner = state.inner.lock().await;
+                let running = inner.sub_runs.values()
+                    .filter(|r| r.project_id == project_id
+                        && matches!(r.status, crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting))
+                    .count();
+                if running >= 3 {
+                    return Ok("[子agent] 当前已有 3 个子 agent 在运行（一主三子限制），请稍后再派。".into());
+                }
+            }
+
+            let spec = crate::subagent::SubAgentSpec {
+                project_id: project_id.to_string(),
+                name: name.clone(),
+                duty,
+                task,
+                agent_type: agent_type.clone(),
+            };
+            let disp_name = name.clone();
+            let disp_type = agent_type.clone();
+            let app2 = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::subagent::run_subagent(app2, spec).await;
+            });
+            Ok(format!(
+                "[子agent] 已派发子 agent「{}」（职责：{}），它在后台独立运行。完成后结果会自动送达；期间你可以继续其它任务或结束本轮。",
+                disp_name, disp_type
+            ))
+        }
+        _ => Err(format!("未知子 agent 工具：{}", call.name)),
+    }
 }
 
 /// `upload_file` 工具：模仿 GUI 手动上传链路（commands::upload_files）。

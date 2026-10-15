@@ -19,6 +19,29 @@ pub struct Conversation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubAgentConv {
+    pub session_id: String,
+    #[serde(default)]
+    pub parent_message_id: Option<i64>,
+    pub created_at: u64,
+    #[serde(default)]
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubAgent {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub duty: String,
+    #[serde(default)]
+    pub account: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub conversations: Vec<SubAgentConv>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,
@@ -27,6 +50,12 @@ pub struct Project {
     pub account: String,
     #[serde(default)]
     pub conversations: Vec<Conversation>,
+    #[serde(default)]
+    pub sub_agents: Vec<SubAgent>,
+    #[serde(default)]
+    pub sub_accounts: Vec<String>,
+    #[serde(default)]
+    pub sub_account_limits: std::collections::HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -264,11 +293,22 @@ impl ProjectStore {
         Ok(())
     }
 
-    /// 生成项目内下一个对话标题：对话N，N 单调递增，删除后不回收编号。
+    /// 生成项目内下一个对话标题：对话N，N = 该项目现有最大编号 + 1。
     pub fn next_conversation_title(&mut self, project_id: &str) -> String {
-        self.conversation_seq += 1;
-        let _ = project_id;
-        format!("对话{}", self.conversation_seq)
+        let max = self
+            .project(project_id)
+            .map(|p| {
+                p.conversations
+                    .iter()
+                    .filter_map(|c| {
+                        c.title.strip_prefix("对话")
+                            .and_then(|r| r.trim().parse::<u64>().ok())
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        format!("对话{}", max + 1)
     }
 
     pub fn workdir_of(&self, project_id: &str) -> Option<String> {
@@ -347,6 +387,9 @@ impl ProjectStore {
             created_at: now_secs(),
             account: account.to_string(),
             conversations: Vec::new(),
+            sub_agents: Vec::new(),
+            sub_accounts: Vec::new(),
+            sub_account_limits: std::collections::HashMap::new(),
         };
         self.projects.insert(0, p.clone());
         self.active_project = Some(p.id.clone());
@@ -410,6 +453,10 @@ impl ProjectStore {
 
         let p = self.project_mut(project_id).ok_or("项目不存在")?;
         p.conversations.retain(|c| c.id != conv_id);
+        // 删除后按当前顺序重排编号，保持 对话1..对话N 连续。
+        for (i, c) in p.conversations.iter_mut().enumerate() {
+            c.title = format!("对话{}", i + 1);
+        }
         let _ = delete_conversation_file(conv_id);
 
         if was_active {
@@ -507,6 +554,170 @@ impl ProjectStore {
                 }
             }
         }
+    }
+
+    pub fn sub_agents_of(&self, project_id: &str) -> Vec<SubAgent> {
+        self.project(project_id)
+            .map(|p| p.sub_agents.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn sub_accounts_of(&self, project_id: &str) -> Vec<String> {
+        self.project(project_id)
+            .map(|p| p.sub_accounts.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_sub_accounts(&mut self, project_id: &str, accounts: Vec<String>) -> bool {
+        match self.project_mut(project_id) {
+            Some(p) => { p.sub_accounts = accounts; true }
+            None => false,
+        }
+    }
+
+    pub fn sub_account_limits_of(&self, project_id: &str) -> std::collections::HashMap<String, u32> {
+        self.project(project_id)
+            .map(|p| p.sub_account_limits.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_sub_account_limits(
+        &mut self,
+        project_id: &str,
+        limits: std::collections::HashMap<String, u32>,
+    ) -> bool {
+        match self.project_mut(project_id) {
+            Some(p) => { p.sub_account_limits = limits; true }
+            None => false,
+        }
+    }
+
+    /// 删除项目中属于指定账号的全部子 agent，返回其 session_id（供删服务端会话）。
+    pub fn remove_sub_agents_by_account(&mut self, project_id: &str, account: &str) -> Vec<String> {
+        let Some(p) = self.project_mut(project_id) else { return Vec::new() };
+        let mut sids = Vec::new();
+        p.sub_agents.retain(|sa| {
+            if sa.account == account {
+                sids.extend(sa.conversations.iter().map(|c| c.session_id.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        sids
+    }
+
+    pub fn find_sub_agent(&self, project_id: &str, name: &str) -> Option<SubAgent> {
+        self.project(project_id)?
+            .sub_agents
+            .iter()
+            .find(|s| s.name == name)
+            .cloned()
+    }
+
+    pub fn add_sub_agent(&mut self, project_id: &str, name: &str, duty: &str, account: &str) -> Option<String> {
+        let p = self.project_mut(project_id)?;
+        if let Some(existing) = p.sub_agents.iter().find(|s| s.name == name) {
+            return Some(existing.id.clone());
+        }
+        let id = gen_id("sub");
+        p.sub_agents.push(SubAgent {
+            id: id.clone(),
+            name: name.to_string(),
+            duty: duty.to_string(),
+            account: account.to_string(),
+            created_at: now_secs(),
+            conversations: Vec::new(),
+        });
+        Some(id)
+    }
+
+    pub fn push_sub_conv(
+        &mut self,
+        project_id: &str,
+        sub_id: &str,
+        session_id: &str,
+        parent_message_id: Option<i64>,
+    ) -> bool {
+        let Some(p) = self.project_mut(project_id) else { return false };
+        let Some(sa) = p.sub_agents.iter_mut().find(|s| s.id == sub_id) else { return false };
+        for c in sa.conversations.iter_mut() {
+            c.is_active = false;
+        }
+        sa.conversations.push(SubAgentConv {
+            session_id: session_id.to_string(),
+            parent_message_id,
+            created_at: now_secs(),
+            is_active: true,
+        });
+        true
+    }
+
+    pub fn set_sub_parent(&mut self, project_id: &str, sub_id: &str, parent: Option<i64>) -> bool {
+        let Some(p) = self.project_mut(project_id) else { return false };
+        let Some(sa) = p.sub_agents.iter_mut().find(|s| s.id == sub_id) else { return false };
+        if let Some(c) = sa.conversations.iter_mut().find(|c| c.is_active) {
+            c.parent_message_id = parent;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 子 agent 首次对话后回写真实 session_id（空占位 → 真实 UUID）。
+    pub fn update_sub_conv_session(
+        &mut self,
+        project_id: &str,
+        sub_id: &str,
+        old_sid: &str,
+        new_sid: &str,
+    ) -> bool {
+        let Some(p) = self.project_mut(project_id) else { return false };
+        let Some(sa) = p.sub_agents.iter_mut().find(|s| s.id == sub_id) else { return false };
+        let target = sa.conversations.iter_mut().find(|c| c.is_active && c.session_id == old_sid);
+        if let Some(c) = target {
+            c.session_id = new_sid.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn active_sub_conv(&self, project_id: &str, sub_id: &str) -> Option<SubAgentConv> {
+        self.project(project_id)?
+            .sub_agents
+            .iter()
+            .find(|s| s.id == sub_id)?
+            .conversations
+            .iter()
+            .find(|c| c.is_active)
+            .cloned()
+    }
+
+    pub fn remove_sub_agent(&mut self, project_id: &str, sub_id: &str) -> Vec<String> {
+        let Some(p) = self.project_mut(project_id) else { return Vec::new() };
+        let Some(pos) = p.sub_agents.iter().position(|s| s.id == sub_id) else { return Vec::new() };
+        let sa = p.sub_agents.remove(pos);
+        sa.conversations.into_iter().map(|c| c.session_id).collect()
+    }
+
+    pub fn remove_sub_conv(
+        &mut self,
+        project_id: &str,
+        sub_id: &str,
+        session_id: &str,
+    ) -> Option<String> {
+        let p = self.project_mut(project_id)?;
+        let sa = p.sub_agents.iter_mut().find(|s| s.id == sub_id)?;
+        let pos = sa.conversations.iter().position(|c| c.session_id == session_id)?;
+        let was_active = sa.conversations[pos].is_active;
+        sa.conversations.remove(pos);
+        if was_active {
+            if let Some(last) = sa.conversations.last_mut() {
+                last.is_active = true;
+            }
+        }
+        Some(session_id.to_string())
     }
 }
 

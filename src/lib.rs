@@ -19,6 +19,7 @@ pub mod qq;
 pub mod runner;
 pub mod shell;
 pub mod state;
+pub mod subagent;
 pub mod tools;
 
 pub fn run() {
@@ -47,6 +48,15 @@ pub fn run() {
                     Err(e) => eprintln!("IDE 文件监听初始化失败: {e}"),
                 }
             });
+            {
+                let state = app.state::<state::AppState>();
+                let inner = state.inner.clone();
+                tauri::async_runtime::spawn(async move {
+                    let f: state::StartTurnFn =
+                        std::sync::Arc::new(|a, p, t| Box::pin(commands::start_turn(a, p, t)));
+                    inner.lock().await.start_turn = Some(f);
+                });
+            }
             Ok(())
         })
         .manage(state::AppState::default())
@@ -60,6 +70,15 @@ pub fn run() {
             commands::rename_project,
             commands::delete_project,
             commands::open_project,
+            commands::list_sub_agents,
+            commands::delete_sub_agent,
+            commands::delete_sub_agent_conv,
+            commands::get_sub_accounts,
+            commands::set_sub_accounts,
+            commands::get_sub_account_limits,
+            commands::set_sub_account_limits,
+            commands::list_sub_candidate_accounts,
+            commands::remove_sub_account,
             commands::list_conversations,
             commands::new_conversation,
             commands::switch_conversation,

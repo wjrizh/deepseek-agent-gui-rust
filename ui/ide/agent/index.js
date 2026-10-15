@@ -27,6 +27,9 @@ function rerender() {
   if (!rootEl || !store) return;
   render(rootEl, store);
   updateControls(store, { sendBtn, stopBtn, input: inputEl });
+  const c = store.subCountText();
+  const bar = document.getElementById("agent-status");
+  if (bar) bar.textContent = c.total ? "子agent " + c.running + "/" + c.total : "";
 }
 
 function doSend() {

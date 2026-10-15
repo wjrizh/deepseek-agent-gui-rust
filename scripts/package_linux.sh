@@ -55,17 +55,8 @@ fi
 echo "==> bridge"
 cp "$ROOT/vendor/deepseek-agent/bridge/bridge_server.mjs" "$ROOT/vendor/deepseek-agent/bridge/browser_login.mjs" "$ROOTDIR/runtime/bridge/"
 
-echo "==> seed accounts"
-for acc in Y HJ; do
-  if [ -d "$HOME/.deepseek-agent/accounts/$acc" ]; then
-    mkdir -p "$ROOTDIR/seed/accounts/$acc"
-    cp -r "$HOME/.deepseek-agent/accounts/$acc/." "$ROOTDIR/seed/accounts/$acc/" 2>/dev/null || true
-  fi
-  if [ -f "$HOME/.ligong/accounts/$acc/state.json" ]; then
-    mkdir -p "$ROOTDIR/seed/ligong-accounts/$acc"
-    cp "$HOME/.ligong/accounts/$acc/state.json" "$ROOTDIR/seed/ligong-accounts/$acc/state.json"
-  fi
-done
+# 不再随包分发任何账户 cookie/登录态（防止他人登录我们的账号）。
+# 用户首次运行需自行登录。
 
 echo "==> run.sh"
 cat > "$ROOTDIR/run.sh" <<'RUNEOF'
@@ -75,6 +66,8 @@ export LIGONG_RUNTIME="$DIR/runtime"
 export LIGONG_NODE="$DIR/runtime/node"
 export LIGONG_PLAYWRIGHT="$DIR/runtime/node_modules/playwright"
 export LIGONG_BRIDGE_DIR="$DIR/runtime/bridge"
+# 打包产物默认无头运行；本机需要界面可设 LIGONG_HEADLESS=0 ./run.sh
+export LIGONG_HEADLESS=1
 CHR="$(find "$DIR/runtime/browsers" -maxdepth 3 -name chrome -type f 2>/dev/null | head -1)"
 if [ -n "$CHR" ]; then export LIGONG_CHROMIUM="$CHR"; fi
 exec "$DIR/力工Studio-Rust" "$@"

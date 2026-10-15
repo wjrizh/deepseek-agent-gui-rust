@@ -45,7 +45,55 @@ pub struct RunCtx {
     pub session: Session,
     pub cancel: Option<CancellationToken>,
     pub busy: bool,
+    pub turn_active: bool,
+    /// 当前主 turn 的代数。每次 start_turn 自增；收尾回调只在代数匹配时清理状态。
+    pub turn_gen: u64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum SubRunStatus {
+    Starting,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Closed,
+}
+
+pub struct SubRunCtx {
+    pub sid: String,
+    pub name: String,
+    pub duty: String,
+    pub project_id: String,
+    pub account: String,
+    pub agent_type: String,
+    pub profile_id: String,
+    pub status: SubRunStatus,
+    pub cancel: CancellationToken,
+    /// 运行实例代数。清理任务和结果回写必须校验，防同名重启覆盖。
+    pub run_generation: u64,
+    pub started_at: Instant,
+    pub attempts: u8,
+    pub last_text: Option<String>,
+    pub last_ok: Option<bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubResult {
+    pub name: String,
+    pub text: String,
+    pub ok: bool,
+}
+
+pub type StartTurnFn = std::sync::Arc<
+    dyn Fn(
+            tauri::AppHandle,
+            String,
+            String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub struct Inner {
     pub tools: Arc<ToolRegistry>,
@@ -60,6 +108,14 @@ pub struct Inner {
     pub qq: Option<QqHandle>,
     /// IDE 文件监听（外部改动同步）。setup 阶段注入。
     pub ide_watcher: Option<crate::ide::watch::IdeWatcher>,
+    /// 子 agent 运行态。key = sid。
+    pub sub_runs: HashMap<String, SubRunCtx>,
+    /// 账号级限流：上次请求时间。
+    pub account_last_at: HashMap<String, Instant>,
+    /// 子 agent 待注入主 agent 的结果。key = project_id。
+    pub pending_sub_results: HashMap<String, Vec<SubResult>>,
+    /// 唤起主 agent 一轮的间接入口（打破 async 类型递归环）。
+    pub start_turn: Option<StartTurnFn>,
 }
 
 pub struct AppState {
@@ -89,6 +145,10 @@ impl Default for AppState {
                 bridge_last_used: HashMap::new(),
                 qq: None,
                 ide_watcher: None,
+                sub_runs: HashMap::new(),
+                account_last_at: HashMap::new(),
+                pending_sub_results: HashMap::new(),
+                start_turn: None,
             })),
             last_request_at: Mutex::new(None),
         }
@@ -191,7 +251,7 @@ impl AppState {
                 Some(bm) => bm,
                 None => {
                     let state_file = home_state_file(&account);
-                    let bridge = BridgeModel::launch(&profile_dir, state_file.as_deref())
+                    let bridge = BridgeModel::launch(&profile_dir, state_file.as_deref(), false)
                         .await
                         .map_err(|e| format!("启动浏览器 bridge 失败: {e}"))?;
                     self.inner.lock().await.bridges.insert(account.clone(), bridge.clone());
@@ -238,6 +298,8 @@ impl AppState {
                 session,
                 cancel: None,
                 busy: false,
+                turn_active: false,
+                turn_gen: 0,
             },
         );
         drop(inner);
@@ -282,6 +344,35 @@ impl AppState {
         }
     }
 
+    /// 账号级最小请求间隔：同账号串行间隔，不同账号互不影响。
+    pub async fn throttle_account(
+        &self,
+        account: &str,
+        min_gap: Duration,
+        cancel: &CancellationToken,
+    ) -> bool {
+        loop {
+            let wait = {
+                let mut inner = self.inner.lock().await;
+                let now = Instant::now();
+                let last = inner.account_last_at.get(account).copied();
+                match last {
+                    Some(t) if now.duration_since(t) < min_gap => {
+                        min_gap - now.duration_since(t)
+                    }
+                    _ => {
+                        inner.account_last_at.insert(account.to_string(), now);
+                        return true;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = cancel.cancelled() => return false,
+            }
+        }
+    }
+
     pub async fn account_lock(&self, account: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut inner = self.inner.lock().await;
         inner.account_locks
@@ -296,6 +387,75 @@ impl AppState {
             .entry(account.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// 为子 agent 创建独立空 profile 目录（不复制 master，避免并发 leveldb 不一致）。
+    /// 登录态由 state.json 注入（cookies + localStorage）。
+    pub fn clone_profile(account: &str, sid: &str) -> Result<PathBuf, String> {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let sub_root = home
+            .join(".deepseek-agent")
+            .join("accounts")
+            .join(account)
+            .join("sub")
+            .join(sid);
+        let dst = sub_root.join("browser");
+        std::fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
+        Ok(dst)
+    }
+
+    /// 取（或建）某子 agent 的 bridge。bridge_key = "<account>#sub-<sid>"。
+    pub async fn ensure_sub_bridge(
+        &self,
+        account: &str,
+        sid: &str,
+    ) -> Result<Arc<BridgeModel>, String> {
+        let key = format!("{account}#sub-{sid}");
+        {
+            let inner = self.inner.lock().await;
+            if let Some(b) = inner.bridges.get(&key) {
+                return Ok(b.clone());
+            }
+        }
+        let profile = Self::clone_profile(account, sid)?;
+        let state_file = home_state_file(account);
+        let init_lock = self.init_lock(&key).await;
+        let _g = init_lock.lock().await;
+        {
+            let inner = self.inner.lock().await;
+            if let Some(b) = inner.bridges.get(&key) {
+                return Ok(b.clone());
+            }
+        }
+        let bridge = BridgeModel::launch(&profile, state_file.as_deref(), true)
+            .await
+            .map_err(|e| format!("启动子 bridge 失败: {e}"))?;
+        self.inner
+            .lock()
+            .await
+            .bridges
+            .insert(key, bridge.clone());
+        Ok(bridge)
+    }
+
+    /// 释放子 bridge 与其 profile。
+    pub async fn release_sub_bridge(&self, account: &str, sid: &str) {
+        let key = format!("{account}#sub-{sid}");
+        let bridge = {
+            let mut inner = self.inner.lock().await;
+            inner.bridges.remove(&key)
+        };
+        if let Some(b) = bridge {
+            b.shutdown().await;
+        }
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let sub_dir = home
+            .join(".deepseek-agent")
+            .join("accounts")
+            .join(account)
+            .join("sub")
+            .join(sid);
+        let _ = std::fs::remove_dir_all(&sub_dir);
     }
 
     pub async fn ensure_account_model(&self, account: &str) -> Result<Arc<BridgeModel>, String> {
@@ -316,7 +476,7 @@ impl AppState {
             ));
         }
         let state_file = home_state_file(account);
-        let bridge = BridgeModel::launch(&profile_dir, state_file.as_deref())
+        let bridge = BridgeModel::launch(&profile_dir, state_file.as_deref(), false)
             .await
             .map_err(|e| format!("启动 bridge 失败: {e}"))?;
         self.inner.lock().await.bridges.insert(account.to_string(), bridge.clone());
@@ -374,8 +534,15 @@ impl AppState {
     }
 
     pub async fn close_all_bridges(&self) {
-        let mut inner = self.inner.lock().await;
-        inner.bridges.clear();
-        inner.bridge_last_used.clear();
+        let bridges: Vec<Arc<BridgeModel>> = {
+            let mut inner = self.inner.lock().await;
+            let list = inner.bridges.values().cloned().collect();
+            inner.bridges.clear();
+            inner.bridge_last_used.clear();
+            list
+        };
+        for b in bridges {
+            b.shutdown().await;
+        }
     }
 }

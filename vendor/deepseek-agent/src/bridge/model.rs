@@ -34,7 +34,7 @@ pub struct BridgeModel {
 }
 
 impl BridgeModel {
-    pub async fn launch(profile_dir: &Path, state_file: Option<&Path>) -> Result<Arc<Self>> {
+    pub async fn launch(profile_dir: &Path, state_file: Option<&Path>, inject_state: bool) -> Result<Arc<Self>> {
         // 清理失效的 profile 锁（上次 bridge 被 kill 但 chromium 未清理时残留）。
         // 仅在 Unix 下执行：Windows 无此机制，且 libc 为 Unix 专属依赖。
         #[cfg(unix)]
@@ -61,6 +61,9 @@ impl BridgeModel {
             .env("LIGONG_PLAYWRIGHT", crate::paths::playwright_dir());
         if let Some(sf) = state_file {
             cmd.env("LIGONG_STATE_FILE", sf);
+        }
+        if inject_state {
+            cmd.env("LIGONG_INJECT_STATE", "1");
         }
         if let Some(ch) = crate::paths::chromium_exec() {
             cmd.env("LIGONG_CHROMIUM", ch);
