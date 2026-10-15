@@ -1541,12 +1541,12 @@ async function newEntry(parentDir, isDir) {
   try {
     const rel = await createPath(projectId, parentDir, name, isDir);
     els.statusPath.textContent = "已创建：" + rel;
-    await tree.refresh();
+    await refreshParent(rel);
     if (!isDir) openFile(rel, name);
     pushHistory({
       label: (isDir ? "新建文件夹 " : "新建文件 ") + rel,
-      undo: async () => { closeTabsUnder(rel); await deletePath(projectId, rel); await tree.refresh(); },
-      redo: async () => { await createPath(projectId, parentDir, name, isDir); await tree.refresh(); },
+      undo: async () => { closeTabsUnder(rel); await deletePath(projectId, rel); tree.removeNode(rel); },
+      redo: async () => { await createPath(projectId, parentDir, name, isDir); await refreshParent(rel); },
     });
   } catch (e) {
     els.statusPath.textContent = "创建失败：" + e;
@@ -1574,11 +1574,11 @@ async function removeEntry(entry) {
     }
     els.statusPath.textContent = only ? "已删除：" + targets[0].rel : `已删除 ${deleted.length} 个项目`;
     tree.clearSelection();
-    await tree.refresh();
+    for (const d of deleted) tree.removeNode(d.rel);
     pushHistory({
       label: only ? "删除 " + targets[0].rel : `删除 ${deleted.length} 个项目`,
-      undo: async () => { for (const d of deleted) await restorePath(projectId, d.trashRel, d.rel); await tree.refresh(); },
-      redo: async () => { for (const d of deleted) await deletePath(projectId, d.rel); await tree.refresh(); },
+      undo: async () => { for (const d of deleted) await restorePath(projectId, d.trashRel, d.rel); for (const d of deleted) await refreshParent(d.rel); },
+      redo: async () => { for (const d of deleted) await deletePath(projectId, d.rel); for (const d of deleted) tree.removeNode(d.rel); },
     });
   } catch (e) {
     els.statusPath.textContent = "删除失败：" + e;
@@ -1592,6 +1592,32 @@ function closeTabsUnder(rel) {
   }
 }
 
+// 让某条目所在父目录重新拉取并原地 Diff（用于撤销/重做后的回填）。
+async function refreshParent(rel) {
+  try { await tree.applyChanges([{ rel, kind: "create" }]); } catch {}
+}
+
+// 移动/重命名后，把已打开文档的路径平滑迁移（保留未保存内容与 Tab），不关闭 Tab。
+function rebaseOpenDocs(oldRel, newRel) {
+  const prefix = oldRel + "/";
+  for (const key of [...openDocs.keys()]) {
+    if (key === oldRel || key.startsWith(prefix)) {
+      const updated = newRel + key.slice(oldRel.length);
+      const doc = openDocs.get(key);
+      openDocs.delete(key);
+      openDocs.set(updated, doc);
+      if (activeRel === key) activeRel = updated;
+    }
+  }
+  if (els.treeHost && els.treeHost.dataset.active) {
+    const act = els.treeHost.dataset.active;
+    if (act === oldRel || act.startsWith(prefix)) {
+      els.treeHost.dataset.active = newRel + act.slice(oldRel.length);
+    }
+  }
+  renderTabs();
+}
+
 async function pasteInto(destDir) {
   if (!clip) return;
   try {
@@ -1600,15 +1626,15 @@ async function pasteInto(destDir) {
       for (const item of clip.items) {
         const rel = await movePath(projectId, item.rel, destDir);
         moved.push({ from: item.rel, to: rel });
-        closeTabsUnder(item.rel);
+        rebaseOpenDocs(item.rel, rel);
+        await tree.moveNode(item.rel, rel);
       }
       clip = null;
       els.statusPath.textContent = moved.length === 1 ? "已移动到：" + moved[0].to : `已移动 ${moved.length} 个项目`;
-      await tree.refresh();
       pushHistory({
         label: moved.length === 1 ? "移动 " + moved[0].from : `移动 ${moved.length} 个项目`,
-        undo: async () => { for (const m of moved) await movePath(projectId, m.to, parentOf(m.from)); await tree.refresh(); },
-        redo: async () => { for (const m of moved) await movePath(projectId, m.from, destDir); await tree.refresh(); },
+        undo: async () => { for (const m of moved) { const back = await movePath(projectId, m.to, parentOf(m.from)); rebaseOpenDocs(m.to, back); await tree.moveNode(m.to, back); } },
+        redo: async () => { for (const m of moved) { const again = await movePath(projectId, m.from, destDir); rebaseOpenDocs(m.from, again); await tree.moveNode(m.from, again); } },
       });
     } else {
       const created = []; // { from, to }
@@ -1617,11 +1643,11 @@ async function pasteInto(destDir) {
         created.push({ from: item.rel, to: rel });
       }
       els.statusPath.textContent = created.length === 1 ? "已复制到：" + created[0].to : `已复制 ${created.length} 个项目`;
-      await tree.refresh();
+      for (const c of created) await refreshParent(c.to);
       pushHistory({
         label: created.length === 1 ? "复制 " + created[0].from : `复制 ${created.length} 个项目`,
-        undo: async () => { for (const c of created) await deletePath(projectId, c.to); await tree.refresh(); },
-        redo: async () => { for (const c of created) await copyPath(projectId, c.from, destDir); await tree.refresh(); },
+        undo: async () => { for (const c of created) { await deletePath(projectId, c.to); tree.removeNode(c.to); } },
+        redo: async () => { for (const c of created) await copyPath(projectId, c.from, destDir); for (const c of created) await refreshParent(c.to); },
       });
     }
   } catch (e) {
@@ -1651,12 +1677,12 @@ async function boot() {
         const oldName = rel.split("/").pop();
         const moved = await movePath(projectId, rel, dir, newName);
         els.statusPath.textContent = "已重命名为：" + moved;
-        closeTabsUnder(rel);
-        await tree.refresh();
+        rebaseOpenDocs(rel, moved);
+        await tree.moveNode(rel, moved);
         pushHistory({
           label: "重命名 " + rel,
-          undo: async () => { await movePath(projectId, moved, dir, oldName); await tree.refresh(); },
-          redo: async () => { await movePath(projectId, rel, dir, newName); await tree.refresh(); },
+          undo: async () => { const back = await movePath(projectId, moved, dir, oldName); rebaseOpenDocs(moved, back); await tree.moveNode(moved, back); },
+          redo: async () => { const again = await movePath(projectId, rel, dir, newName); rebaseOpenDocs(rel, again); await tree.moveNode(rel, again); },
         });
         return true;
       } catch (e) {
@@ -1668,12 +1694,31 @@ async function boot() {
       try {
         const rel = await movePath(projectId, src, destDir);
         els.statusPath.textContent = "已移动：" + rel;
-        closeTabsUnder(src);
-        await tree.refresh();
+        rebaseOpenDocs(src, rel);
+        await tree.moveNode(src, rel);
         pushHistory({
           label: "移动 " + src,
-          undo: async () => { await movePath(projectId, rel, parentOf(src)); await tree.refresh(); },
-          redo: async () => { await movePath(projectId, src, destDir); await tree.refresh(); },
+          undo: async () => { const back = await movePath(projectId, rel, parentOf(src)); rebaseOpenDocs(rel, back); await tree.moveNode(rel, back); },
+          redo: async () => { const again = await movePath(projectId, src, destDir); rebaseOpenDocs(src, again); await tree.moveNode(src, again); },
+        });
+      } catch (e) {
+        els.statusPath.textContent = "移动失败：" + e;
+      }
+    },
+    onMoveBatch: async (srcList, destDir) => {
+      const moved = [];
+      try {
+        for (const src of srcList) {
+          const rel = await movePath(projectId, src, destDir);
+          rebaseOpenDocs(src, rel);
+          await tree.moveNode(src, rel);
+          moved.push({ old: src, rel });
+        }
+        els.statusPath.textContent = "已移动 " + moved.length + " 项";
+        pushHistory({
+          label: "移动 " + moved.length + " 项",
+          undo: async () => { for (const m of moved) { const back = await movePath(projectId, m.rel, parentOf(m.old)); rebaseOpenDocs(m.rel, back); await tree.moveNode(m.rel, back); } },
+          redo: async () => { for (const m of moved) { const again = await movePath(projectId, m.old, destDir); rebaseOpenDocs(m.old, again); await tree.moveNode(m.old, again); } },
         });
       } catch (e) {
         els.statusPath.textContent = "移动失败：" + e;

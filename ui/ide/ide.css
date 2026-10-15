@@ -1065,3 +1065,20 @@ html, body {
   0%, 100% { opacity: 1; }
   50% { opacity: .3; }
 }
+
+/* —— 文件树新内核（状态驱动原地 Diff）—— */
+.tree-node { display: block; }
+.tree-row.focused { outline: 1px solid rgba(91, 140, 255, 0.55); outline-offset: -1px; }
+.tree-row.dragging { opacity: 0.45; }
+/* 拖拽命中的目标父目录整块高亮（VS Code 风） */
+.tree-node.drop-target-dir > .tree-row {
+  background: var(--accent-soft);
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+}
+.tree-node.drop-target-dir > .tree-children {
+  background: rgba(91, 140, 255, 0.06);
+  border-left: 1px dashed rgba(91, 140, 255, 0.4);
+}
+/* 拖到空白处 = 移入根目录 */
+.file-tree.drop-root-target { background: rgba(91, 140, 255, 0.05); outline: 1px dashed rgba(91, 140, 255, 0.4); outline-offset: -2px; }

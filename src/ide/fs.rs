@@ -26,6 +26,50 @@ pub struct DirEntry {
 /// 读取文本文件的大小上限（超过则拒绝，避免 IDE 卡死）。
 const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
 
+/// 自然序比较：连续数字按数值比较（file2 <file10），其余不区分大小写。
+fn natord_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ia = a.chars().peekable();
+    let mut ib = b.chars().peekable();
+    while let (Some(&ca), Some(&cb)) = (ia.peek(), ib.peek()) {
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            let mut na: u64 = 0;
+            while let Some(d) = ia.peek().and_then(|c| c.to_digit(10)) {
+                na = na.saturating_mul(10).saturating_add(d as u64);
+                ia.next();
+            }
+            let mut nb: u64 = 0;
+            while let Some(d) = ib.peek().and_then(|c| c.to_digit(10)) {
+                nb = nb.saturating_mul(10).saturating_add(d as u64);
+                ib.next();
+            }
+            match na.cmp(&nb) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        let la = ca.to_ascii_lowercase();
+        let lb = cb.to_ascii_lowercase();
+        match la.cmp(&lb) {
+            std::cmp::Ordering::Equal => { ia.next(); ib.next(); }
+            ord => return ord,
+        }
+    }
+    ia.count().cmp(&ib.count())
+}
+
+/// 对给定的绝对路径及其父目录调用 watcher 抑制，避免 IDE 自身写盘触发回灌事件。
+async fn suppress_paths(state: &State<'_, AppState>, paths: &[std::path::PathBuf]) {
+    let inner = state.inner.lock().await;
+    if let Some(w) = &inner.ide_watcher {
+        for p in paths {
+            w.suppress_path(p);
+            if let Some(parent) = p.parent() {
+                w.suppress_path(parent);
+            }
+        }
+    }
+}
+
 /// IDE 删除暂存目录名（位于工作目录根，不显示在文件树中）。
 pub const TRASH_DIR: &str = ".ligong-ide-trash";
 
@@ -97,12 +141,8 @@ pub async fn ide_list_dir(
         });
     }
 
-    // 目录优先，其次按名称（不区分大小写）排序。
-    out.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    // 目录优先，其次按名称自然序（不区分大小写，file2 排在 file10 前）。
+    out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| natord_cmp(&a.name, &b.name)));
     Ok(out)
 }
 
@@ -199,6 +239,7 @@ pub async fn ide_delete(
     let slot = trash_root.join(&id);
     std::fs::create_dir_all(&slot).map_err(|e| format!("创建暂存目录失败: {e}"))?;
     let dest = slot.join(&name);
+    suppress_paths(&state, &[target.clone()]).await;
     std::fs::rename(&target, &dest).map_err(|e| format!("移入暂存区失败: {e}"))?;
     // 记录原始相对路径，供恢复时还原位置。
     let orig = path::to_rel(&root, &target);
@@ -291,6 +332,7 @@ pub async fn ide_copy(
     if target.exists() {
         return Err(format!("目标已存在：{}", path::to_rel(&root, &target)));
     }
+    suppress_paths(&state, &[target.clone()]).await;
     copy_recursive(&src, &target)?;
     Ok(path::to_rel(&root, &target))
 }
@@ -335,6 +377,7 @@ pub async fn ide_move(
     if target.exists() {
         return Err(format!("目标已存在：{}", path::to_rel(&root, &target)));
     }
+    suppress_paths(&state, &[src.clone(), target.clone()]).await;
     std::fs::rename(&src, &target).map_err(|e| format!("移动失败: {e}"))?;
     Ok(path::to_rel(&root, &target))
 }
@@ -366,6 +409,7 @@ pub async fn ide_create(
     if target.exists() {
         return Err(format!("已存在：{}", path::to_rel(&root, &target)));
     }
+    suppress_paths(&state, &[target.clone()]).await;
     if is_dir {
         std::fs::create_dir(&target).map_err(|e| format!("创建目录失败: {e}"))?;
     } else {
