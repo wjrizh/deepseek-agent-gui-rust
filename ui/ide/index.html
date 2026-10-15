@@ -128,15 +128,33 @@
         </div>
         <div id="diff-host" class="diff-host hidden"></div>
       </div>
-      <div id="terminal-panel" class="terminal-panel hidden">
-        <div class="term-head">
-          <div id="term-tabs" class="term-tabs"></div>
-          <div class="term-actions">
-            <button id="term-new" class="term-btn" title="新建终端">＋</button>
-            <button id="term-hide" class="term-btn" title="隐藏终端">✕</button>
+      <div id="bottom-panel" class="bottom-panel hidden">
+        <div class="bottom-tabs">
+          <button id="bottom-tab-term" class="bottom-tab active">终端</button>
+          <button id="bottom-tab-agent" class="bottom-tab">对话</button>
+          <div class="bottom-actions">
+            <button id="bottom-close" class="term-btn" title="隐藏面板">✕</button>
           </div>
         </div>
-        <div id="term-hosts" class="term-hosts"></div>
+
+        <div id="terminal-panel" class="terminal-panel">
+          <div class="term-head">
+            <div id="term-tabs" class="term-tabs"></div>
+            <div class="term-actions">
+              <button id="term-new" class="term-btn" title="新建终端">＋</button>
+            </div>
+          </div>
+          <div id="term-hosts" class="term-hosts"></div>
+        </div>
+
+        <div id="agent-panel" class="agent-panel hidden">
+          <div id="agent-body" class="agent-body"></div>
+          <div class="agent-input-row">
+            <textarea id="agent-input" class="agent-input" rows="1" placeholder="输入消息（Enter 发送，Shift+Enter 换行；可拖入文件）"></textarea>
+            <button id="agent-send" class="agent-btn primary" title="发送">发送</button>
+            <button id="agent-stop" class="agent-btn danger hidden" title="停止">停止</button>
+          </div>
+        </div>
       </div>
       <div id="statusbar" class="statusbar">
         <span id="status-path">就绪</span>

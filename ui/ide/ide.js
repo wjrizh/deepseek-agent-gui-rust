@@ -12,7 +12,8 @@ import {
   gitInit, gitFetch, gitClone, gitMerge, gitMergeAbort, gitResolve,
   gitStashPush, gitStashList, gitStashOp, gitFileLog, gitBlame,
 } from "./api.js";
-import { initTerminal, toggleTerminal } from "./term.js";
+import { initTerminal } from "./term.js";
+import { initBottom, toggleBottom, setProjectId } from "./bottom.js";
 
 // 剪贴板：仅记录一次复制/剪切操作的相对路径，粘贴时读取。
 let clip = null; // { items: [{rel, isDir}], mode: "copy" | "cut" }
@@ -1706,7 +1707,13 @@ async function boot() {
       // 终端内聚焦时不拦截，交由 shell 处理 Ctrl+T。
       if (e.target.closest && e.target.closest(".terminal-panel")) return;
       e.preventDefault();
-      toggleTerminal();
+      toggleBottom("term");
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "j") {
+      // 输入框内聚焦时不拦截（对话输入框用 Ctrl+J 无意义，但避免误触）。
+      if (e.target.closest && e.target.closest(".agent-panel")) return;
+      e.preventDefault();
+      toggleBottom("agent");
     }
   });
 
@@ -1736,7 +1743,9 @@ async function boot() {
   installScm();
   installFsWatch();
   installAgentDiffWatch();
+  setProjectId(projectId);
   initTerminal({ projectId, cwdProvider: () => projectRootAbs || "" });
+  initBottom({ projectId, cwdProvider: () => projectRootAbs || "" });
   refreshGit();
 }
 

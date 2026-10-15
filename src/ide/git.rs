@@ -131,7 +131,7 @@ pub async fn ide_git_status(
         }
     }
 
-    let (_, out, _) = run_git(&root, &["status", "--porcelain=v1", "-z"])?;
+    let (_, out, _) = run_git(&root, &["status", "--porcelain=v1", "-z", "-uall"])?;
     let files = parse_status(&out);
 
     Ok(GitStatus {
@@ -165,6 +165,11 @@ fn parse_status(raw: &str) -> Vec<GitFile> {
             let _ = it.next();
         }
         path = path.trim_matches('"').to_string();
+        // 未跟踪目录在未加 -uall 时会以 "dir/" 形式出现，前端会渲染成空文件名。
+        // 加 -uall 后不应再有此类条目，这里再兜底跳过，避免空名行。
+        if path.is_empty() || path.ends_with('/') {
+            continue;
+        }
         let staged = x.to_string();
         let worktree = y.to_string();
         let untracked = x == "?";
@@ -877,6 +882,16 @@ mod tests {
         assert!(!files[0].untracked);
         assert_eq!(files[1].rel, "new.txt");
         assert!(files[1].untracked);
+    }
+
+    #[test]
+    fn skips_untracked_directory_entry() {
+        // 未加 -uall 时未跟踪目录形如 "?? dir/"，应被跳过而非渲染成空文件名。
+        let raw = "?? ui/ide/agent/\0?? new.txt\0";
+        let files = parse_status(raw);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].rel, "new.txt");
+        assert!(files[0].untracked);
     }
 
     #[test]

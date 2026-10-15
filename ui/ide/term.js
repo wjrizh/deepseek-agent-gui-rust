@@ -1,11 +1,11 @@
 // IDE 底部终端：多 tab、xterm 实例管理、PTY 通信。
-// 仅依赖 api.js 的 term* 封装；不参与 Agent 主流程。
+// 面板显隐由 bottom.js 管理；本模块只管终端实例。
 
 import { termOpen, termWrite, termResize, termClose } from "./api.js";
 import { Terminal } from "../vendor/xterm/xterm.mjs";
 import { FitAddon } from "../vendor/xterm/addon-fit.mjs";
 
-let panel, tabsEl, hostsEl;
+let tabsEl, hostsEl;
 let getCwd = () => "";
 let seq = 0;
 const sessions = new Map(); // id -> { term, fit, host, tabEl, disposers }
@@ -22,29 +22,21 @@ function setActive(id) {
     s.tabEl.classList.toggle("active", on);
   }
   const s = sessions.get(id);
-  if (s) { s.fit.fit(); s.term.focus(); }
+  if (s) { try { s.fit.fit(); } catch {} s.term.focus(); }
 }
 
-export function isTerminalVisible() {
-  return panel && !panel.classList.contains("hidden");
-}
-
-export function showTerminal() {
-  if (!panel) return;
-  panel.classList.remove("hidden");
-  void panel.offsetHeight; // 强制 reflow，确保尺寸就绪
+// 首次创建终端实例（供 bottom.js 在显示终端 tab 时调用）。
+export function ensureTerminal() {
   if (!sessions.size) newTerminal();
   else { const id = activeId() || sessions.keys().next().value; setActive(id); }
 }
 
-export function hideTerminal() {
-  if (panel) panel.classList.add("hidden");
+// 重排所有终端（面板尺寸变化时）。
+export function fitTerminal() {
+  for (const s of sessions.values()) { try { s.fit.fit(); } catch {} }
 }
 
-export function toggleTerminal() {
-  if (isTerminalVisible()) hideTerminal();
-  else showTerminal();
-}
+export function setTerminalCwdProvider(fn) { getCwd = fn || (() => ""); }
 
 export function newTerminal() {
   const id = "term-" + (++seq);
@@ -139,35 +131,10 @@ export async function closeTerminal(id) {
 }
 
 export function initTerminal({ projectId, cwdProvider }) {
-  panel = document.getElementById("terminal-panel");
   tabsEl = document.getElementById("term-tabs");
   hostsEl = document.getElementById("term-hosts");
-  if (!panel) return;
   getCwd = cwdProvider || (() => "");
+  if (!tabsEl || !hostsEl) return;
 
-  document.getElementById("term-new")?.addEventListener("click", () => { showTerminal(); newTerminal(); });
-  document.getElementById("term-hide")?.addEventListener("click", hideTerminal);
-
-  // 顶部拖拽调整高度。
-  const resizer = document.createElement("div");
-  resizer.className = "term-resizer";
-  panel.prepend(resizer);
-  let dragging = false;
-  resizer.addEventListener("mousedown", (e) => {
-    dragging = true;
-    panel.classList.add("resizing");
-    e.preventDefault();
-  });
-  window.addEventListener("mousemove", (e) => {
-    if (!dragging) return;
-    const bottom = panel.getBoundingClientRect().bottom;
-    const h = Math.max(80, Math.min(window.innerHeight - 120, bottom - e.clientY));
-    panel.style.height = h + "px";
-    for (const s of sessions.values()) s.fit.fit();
-  });
-  window.addEventListener("mouseup", () => {
-    if (!dragging) return;
-    dragging = false;
-    panel.classList.remove("resizing");
-  });
+  document.getElementById("term-new")?.addEventListener("click", () => newTerminal());
 }

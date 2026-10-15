@@ -830,17 +830,55 @@ html, body {
   background: #4a9eff; margin-left: 6px; flex: 0 0 auto;
 }
 
-/* —— 底部终端面板 —— */
-.terminal-panel {
+/* —— 底部面板（终端 / 对话） —— */
+.bottom-panel {
   display: flex;
   flex-direction: column;
   height: 260px;
-  min-height: 80px;
+  min-height: 120px;
   border-top: 1px solid var(--border, #333);
   background: #1e1e1e;
   position: relative;
 }
-.terminal-panel.resizing { user-select: none; }
+.bottom-panel.hidden { display: none; }
+.bottom-panel.resizing { user-select: none; }
+.bottom-tabs {
+  display: flex;
+  align-items: center;
+  height: 30px;
+  padding: 0 6px;
+  background: #252526;
+  border-bottom: 1px solid #333;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+.bottom-tab {
+  background: transparent;
+  border: none;
+  color: #999;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 4px 4px 0 0;
+}
+.bottom-tab.active { color: #fff; background: #1e1e1e; }
+.bottom-actions { margin-left: auto; display: flex; gap: 4px; }
+.bottom-resizer {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 4px;
+  cursor: ns-resize;
+  z-index: 5;
+}
+
+.terminal-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+}
+.terminal-panel.hidden { display: none; }
 .term-head {
   display: flex;
   align-items: center;
@@ -900,3 +938,130 @@ html, body {
   overflow: hidden;
 }
 .preview-item.hidden { display: none; }
+
+/* —— Agent 对话面板 —— */
+.agent-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.agent-panel.hidden { display: none; }
+.agent-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ag-msg { display: flex; }
+.ag-msg.ag-user { justify-content: flex-end; }
+.ag-msg.ag-assistant { justify-content: flex-start; }
+.ag-bubble {
+  max-width: 80%;
+  padding: 6px 10px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ag-user .ag-bubble { background: #2b5278; color: #fff; }
+.ag-assistant .ag-bubble { background: #2d2d2d; color: #e0e0e0; }
+.ag-files { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.ag-file {
+  font-size: 11px;
+  background: rgba(255,255,255,.1);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.ag-notice {
+  font-size: 12px;
+  color: #d0a030;
+  padding: 2px 6px;
+}
+.ag-tool {
+  border: 1px solid #3a3d41;
+  border-radius: 6px;
+  background: #252526;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.ag-tool-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; cursor: pointer; user-select: none; }
+.ag-tool-arrow { color: #888; font-size: 10px; width: 10px; flex: none; }
+.ag-tool-body { display: none; }
+.ag-tool.expanded .ag-tool-body { display: block; }
+.ag-tool-name { color: #4ec9b0; font-weight: 600; }
+.ag-tool-status { color: #888; margin-left: auto; font-size: 11px; }
+.ag-tool.done .ag-tool-status { color: #6a9955; }
+.ag-tool.error .ag-tool-status { color: #f14c4c; }
+.ag-tool-cmd {
+  width: 100%;
+  color: #ce9178;
+  font-family: monospace;
+  font-size: 11px;
+  margin-top: 2px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.ag-tool-out {
+  margin: 6px 0 0;
+  padding: 6px;
+  background: #1a1a1a;
+  border-radius: 4px;
+  max-height: 200px;
+  overflow: auto;
+  font-family: monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #ccc;
+}
+.agent-input-row {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+  border-top: 1px solid #333;
+  background: #252526;
+}
+.agent-input {
+  flex: 1 1 auto;
+  resize: none;
+  background: #1e1e1e;
+  color: #e0e0e0;
+  border: 1px solid #3a3d41;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  max-height: 120px;
+}
+.agent-input:focus { outline: none; border-color: #007aff; }
+.agent-btn {
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 12.5px;
+  cursor: pointer;
+  color: #fff;
+}
+.agent-btn.primary { background: #0e639c; }
+.agent-btn.primary:hover { background: #1177bb; }
+.agent-btn.danger { background: #a1260d; }
+.agent-btn.danger:hover { background: #c42b1c; }
+.agent-btn.hidden { display: none; }
+
+/* 标题栏状态点：Agent 工作时的红色脉冲。 */
+.title-dot.working {
+  background: #ff3b30;
+  box-shadow: 0 0 10px #ff3b30;
+  animation: dot-pulse 1s ease-in-out infinite;
+}
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
