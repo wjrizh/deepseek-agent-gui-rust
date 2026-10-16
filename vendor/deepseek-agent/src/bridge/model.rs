@@ -31,6 +31,8 @@ pub struct BridgeModel {
     stdin: Mutex<ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
     req_seq: std::sync::atomic::AtomicU64,
+    /// P1-6：启动时的登录态检测结果："ok" | "login" | "unknown"。
+    auth_status: Mutex<String>,
 }
 
 impl BridgeModel {
@@ -104,13 +106,29 @@ impl BridgeModel {
         if v.get("ready") != Some(&serde_json::Value::Bool(true)) {
             return Err(AgentError::Other(format!("bridge 未就绪: {line}")));
         }
+        // P1-6：读取 bridge 启动时的登录态检测结果。
+        let auth_status = v
+            .get("auth")
+            .and_then(|a| a.get("status"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        if auth_status == "login" {
+            eprintln!("[bridge] 登录态检测：需要重新登录 (profile={})", profile_dir.display());
+        }
 
         Ok(Arc::new(Self {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(stdout),
             req_seq: std::sync::atomic::AtomicU64::new(0),
+            auth_status: Mutex::new(auth_status),
         }))
+    }
+
+    /// P1-6：返回启动时检测到的登录态。
+    pub async fn auth_status(&self) -> String {
+        self.auth_status.lock().await.clone()
     }
 
     pub async fn stop(&self) {
@@ -219,6 +237,12 @@ impl BridgeModel {
         };
 
         if v.get("ok") == Some(&serde_json::Value::Bool(true)) {
+            // P1-1：bridge 选择器告警（页面结构可能已更新）记录到日志。
+            if let Some(ws) = v.get("warnings").and_then(|x| x.as_array()) {
+                if !ws.is_empty() {
+                    eprintln!("[bridge] SELECTOR-WARNING x{}: {}", ws.len(), serde_json::to_string(ws).unwrap_or_default());
+                }
+            }
             let answer = v["text"].as_str().unwrap_or("").to_string();
             let think = v["think"].as_str().unwrap_or("").to_string();
             let mid = v["message_id"].as_i64();

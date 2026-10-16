@@ -70,10 +70,33 @@ function showProject(pid) {
     const el = document.getElementById("compact-input");
     if (el) el.value = n;
   }).catch(() => {});
+  invoke("get_max_sub", { projectId: pid }).then((n) => {
+    const el = document.getElementById("maxsub-input");
+    if (el) el.value = n;
+  }).catch(() => {});
+  invoke("get_warmup", { projectId: pid }).then((on) => {
+    const el = document.getElementById("warmup-check");
+    if (el) el.checked = !!on;
+  }).catch(() => {});
   invoke("busy_projects").then((busy) => {
     const isBusy = Array.isArray(busy) && busy.includes(pid);
     if (v) v.running = isBusy;
     if (activeProjectId === pid) setRunning(isBusy);
+  }).catch(() => {});
+  // 从后端运行态快照初始化子 agent 状态条（与 sub-* 事件同一状态集）。
+  invoke("list_sub_runs", { projectId: pid }).then((runs) => {
+    if (activeProjectId !== pid || !Array.isArray(runs)) return;
+    for (const r of runs) {
+      if (r.status === "closed") continue;
+      const label = r.status === "succeeded" ? "已完成"
+        : r.status === "failed" ? "失败"
+        : r.status === "cancelled" ? "已取消"
+        : "运行中";
+      const state = r.status === "succeeded" ? "done"
+        : (r.status === "failed" || r.status === "cancelled") ? "failed"
+        : "running";
+      subSet(r.project_id, r.sub_id, { name: r.name, label, state }, r.run_generation);
+    }
   }).catch(() => {});
 }
 
@@ -252,7 +275,9 @@ function toolComplete(v, card, ms, error) {
 
 
 listen("agent://delta", (e) => {
-  const { project_id, kind, text } = e.payload || {};
+  const { project_id, kind, text, sub_id } = e.payload || {};
+  // 子 agent 的流式输出不进主对话区（由子 agent 状态条单独呈现）。
+  if (sub_id) return;
   const v = project_id ? view(project_id) : activeView();
   if (!v) return;
   if (kind === "thinking") return;
@@ -267,7 +292,9 @@ listen("agent://delta", (e) => {
 });
 
 listen("agent://tool", (e) => {
-  const { project_id, phase, name, command, output, image, ms, error, call_id } = e.payload || {};
+  const { project_id, phase, name, command, output, image, ms, error, call_id, sub_id } = e.payload || {};
+  // 子 agent 的工具卡不进主对话区。
+  if (sub_id) return;
   const v = project_id ? view(project_id) : activeView();
   if (!v) return;
   if (phase === "call") hideThinking(v);
@@ -366,9 +393,49 @@ listen("agent://error", (e) => {
     }
     v.currentAssistant = null; v.currentAssistantText = ""; v.currentThinking = null;
   }
-  addMsg(v, "assistant", "⚠ " + (message || "未知错误"));
+  const um = e.payload && e.payload.user_message ? e.payload.user_message : (message || "未知错误");
+  const msgEl = addMsg(v, "assistant", "⚠ " + um);
+  const cat = e.payload && e.payload.category;
+  const retryable = e.payload && e.payload.retryable;
+  const tech = e.payload && e.payload.technical_message ? e.payload.technical_message : (message || "");
+  const bar = document.createElement("div");
+  bar.className = "err-actions";
+  if (retryable) {
+    const rb = document.createElement("button");
+    rb.className = "err-act"; rb.textContent = "重试";
+    rb.onclick = () => { if (project_id !== activeProjectId) return; inputEl.focus(); iosToast("请确认输入后回车重发"); };
+    bar.appendChild(rb);
+  }
+  if (cat === "auth") {
+    const lb = document.createElement("button");
+    lb.className = "err-act"; lb.textContent = "重新登录";
+    lb.onclick = () => { iosToast("请在左侧账号管理重新登录：" + (e.payload && e.payload.account || "")); };
+    bar.appendChild(lb);
+  }
+  const cb = document.createElement("button");
+  cb.className = "err-act"; cb.textContent = "复制诊断";
+  cb.onclick = () => {
+    const diag = "category=" + (cat || "") + "\naccount=" + (e.payload && e.payload.account || "")
+      + "\nproject=" + (project_id || "") + "\n" + tech;
+    try { navigator.clipboard.writeText(diag); } catch {}
+  };
+  bar.appendChild(cb);
+  msgEl.appendChild(bar);
   v.running = false;
   if (project_id === activeProjectId) setRunning(false);
+});
+
+listen("agent://ask", (e) => {
+  const p = e.payload || {};
+  if (p.project_id !== activeProjectId) return;
+  const v = view(activeProjectId);
+  if (v) {
+    hideThinking(v);
+    addMsg(v, "assistant", p.question || "");
+    v.running = false;
+    flushRender(v);
+  }
+  setRunning(false);
 });
 
 listen("agent://approval", (e) => {
@@ -469,6 +536,20 @@ if (restrictCheck) {
     }
   };
 }
+const warmupCheck = document.getElementById("warmup-check");
+if (warmupCheck) {
+  warmupCheck.onchange = async () => {
+    if (!activeProjectId) { warmupCheck.checked = false; return; }
+    const on = warmupCheck.checked;
+    try {
+      await invoke("set_warmup", { projectId: activeProjectId, on });
+      iosToast(on ? "已开启预热（下次打开项目生效）" : "已关闭预热");
+    } catch (e) {
+      warmupCheck.checked = !on;
+      iosToast("切换失败：" + e);
+    }
+  };
+}
 const compactInput = document.getElementById("compact-input");
 if (compactInput) {
   const applyCompact = async () => {
@@ -489,6 +570,27 @@ if (compactInput) {
   compactInput.onchange = applyCompact;
   compactInput.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); compactInput.blur(); } };
   compactInput.onblur = applyCompact;
+}
+const maxsubInput = document.getElementById("maxsub-input");
+if (maxsubInput) {
+  const applyMaxSub = async () => {
+    if (!activeProjectId) { iosToast("请先选择一个项目"); return; }
+    const n = parseInt(maxsubInput.value, 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      iosToast("子agent上限必须为正整数");
+      invoke("get_max_sub", { projectId: activeProjectId })
+        .then((v) => { maxsubInput.value = v; }).catch(() => {});
+      return;
+    }
+    try {
+      const saved = await invoke("set_max_sub", { projectId: activeProjectId, value: n });
+      maxsubInput.value = saved;
+      iosToast("子agent上限已设为 " + saved);
+    } catch (e) { iosToast("保存失败：" + e); }
+  };
+  maxsubInput.onchange = applyMaxSub;
+  maxsubInput.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); maxsubInput.blur(); } };
+  maxsubInput.onblur = applyMaxSub;
 }
 const ideBtn = document.getElementById("ide-btn");
 if (ideBtn) {
@@ -1003,14 +1105,20 @@ function closeProjectSettings() {
   settingsProjectId = null;
 }
 
+let _renderConvSeq = 0;
 async function renderConversations() {
+  const seq = ++_renderConvSeq;
+  const pidAtStart = settingsProjectId;
   let convs = [];
   try { convs = await invoke("list_conversations", { projectId: settingsProjectId }); }
   catch { convs = []; }
-  settingsConvCount.textContent = convs.length;
-  settingsConvList.innerHTML = "";
+  // 子面板各自带并发保护，先刷新（即使本次对话列表渲染被放弃，子面板仍更新）。
   await renderSubAgents();
   await renderSubAccounts();
+  // 并发重入保护：期间若有更新的渲染请求，放弃本次（避免旧请求在清空后 append，造成列表重复）。
+  if (seq !== _renderConvSeq || pidAtStart !== settingsProjectId) return;
+  settingsConvCount.textContent = convs.length;
+  settingsConvList.innerHTML = "";
   if (!convs.length) {
     const empty = document.createElement("div");
     empty.className = "conv-empty";
@@ -1023,7 +1131,7 @@ async function renderConversations() {
     row.className = "conv-item" + (c.active ? " active" : "");
     row.innerHTML =
       '<span class="conv-box">' + (c.active ? "●" : "○") + '</span>' +
-      '<span class="conv-title">' + escapeHtml(c.title || "新对话") + '</span>' +
+      '<span class="conv-title" title="session: ' + escapeHtml(c.id || "") + '">' + escapeHtml(c.title || "新对话") + '</span>' +
       '<span class="conv-meta">共 ' + c.message_count + ' 条</span>' +
       '<button class="conv-detach" title="移出项目（保留本地记录与云端会话）">' +
         '<svg viewBox="0 0 24 24" width="13" height="13"><path d="M9 7H6v10h10v-3M14 6h4v4M18 6l-7 7" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
@@ -1070,20 +1178,27 @@ async function renderConversations() {
   });
 }
 
+let _renderSubAccSeq = 0;
 async function renderSubAccounts() {
   const host = document.getElementById("settings-sub-accounts");
   if (!host) return;
+  const seq = ++_renderSubAccSeq;
   let candidates = [];
   try { candidates = await invoke("list_sub_candidate_accounts"); } catch { candidates = []; }
   let order = [];
   try { order = await invoke("get_sub_accounts", { projectId: settingsProjectId }); } catch { order = []; }
   let limits = {};
   try { limits = await invoke("get_sub_account_limits", { projectId: settingsProjectId }); } catch { limits = {}; }
+  let mode = "permanent";
+  try { mode = await invoke("get_sub_account_mode", { projectId: settingsProjectId }); } catch { mode = "permanent"; }
   let projectAccount = "";
   try {
     const p = (await invoke("list_projects")).find((x) => x.id === settingsProjectId);
     projectAccount = p ? p.account : "";
   } catch {}
+
+  // 并发重入保护：期间若有更新的渲染请求，放弃本次（避免旧请求覆盖新 DOM）。
+  if (seq !== _renderSubAccSeq) return;
 
   if (projectAccount && !order.includes(projectAccount)) order.push(projectAccount);
   order = order.filter((a) => a === projectAccount || candidates.includes(a));
@@ -1092,11 +1207,37 @@ async function renderSubAccounts() {
   const othersSum = order.filter((a) => a !== projectAccount).reduce((s, a) => s + (limits[a] || 0), 0);
   const mainLimit = Math.max(0, 3 - othersSum);
 
+  // 账号池计费口径：permanent（历史绑定长期占用）/ active（仅运行中占用）。
+  const modeWrap = document.createElement("div");
+  modeWrap.className = "sub-acc-mode";
+  const modeLabel = document.createElement("span");
+  modeLabel.className = "sub-acc-mode-label";
+  modeLabel.textContent = "账号占用：";
+  const modeSel = document.createElement("select");
+  modeSel.className = "sub-acc-mode-sel";
+  [["permanent", "永久占用（历史绑定计数）"], ["active", "运行时占用（仅运行中子 agent 计数）"]].forEach(([v, t]) => {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = t;
+    if (v === mode) o.selected = true;
+    modeSel.appendChild(o);
+  });
+  modeSel.onchange = async () => {
+    try {
+      await invoke("set_sub_account_mode", { projectId: settingsProjectId, mode: modeSel.value });
+      await renderSubAccounts();
+    } catch (e) { iosToast("设置失败：" + (e && e.message ? e.message : e)); }
+  };
+  modeWrap.append(modeLabel, modeSel);
+  host.appendChild(modeWrap);
+
   const list = document.createElement("div");
   list.className = "sub-acc-list";
   host.appendChild(list);
 
+  let _saving = false;
   const saveAll = async () => {
+    if (_saving) return;
+    _saving = true;
     const rows = [...list.querySelectorAll(".sub-acc-row")];
     const newOrder = rows.map((r) => r.dataset.acc).filter((a) => a);
     const newLimits = {};
@@ -1111,6 +1252,7 @@ async function renderSubAccounts() {
       await invoke("set_sub_account_limits", { projectId: settingsProjectId, limits: newLimits });
       await renderSubAccounts();
     } catch (e) { iosToast("保存失败：" + (e && e.message ? e.message : e)); }
+    finally { _saving = false; }
   };
 
   order.forEach((acc) => {
@@ -1209,11 +1351,15 @@ async function renderSubAccounts() {
   }
 }
 
+let _renderSubAgentSeq = 0;
 async function renderSubAgents() {
   if (!settingsSubList) return;
+  const seq = ++_renderSubAgentSeq;
+  const pidAtStart = settingsProjectId;
   let subs = [];
   try { subs = await invoke("list_sub_agents", { projectId: settingsProjectId }); }
   catch { subs = []; }
+  if (seq !== _renderSubAgentSeq || pidAtStart !== settingsProjectId) return;
   settingsSubList.innerHTML = "";
   if (!subs.length) {
     const empty = document.createElement("div");
@@ -1451,6 +1597,105 @@ listen("agent://delete-progress", (e) => {
   if (!el) return;
   if (p.phase === "deleting") el.textContent = "删除中…（" + p.current + "/" + p.total + "）";
   else if (p.phase === "finishing") el.textContent = "正在删除项目…";
+});
+
+// ===== 子 agent 状态条 =====
+// 在主对话区底部实时显示本项目子 agent 的运行状态；子 agent 的流式输出与工具卡
+// 不进主对话（见上文 delta/tool 监听的 sub_id 过滤）。
+const subStatus = new Map(); // project_id -> Map(sub_id -> {el, name})
+
+function subBarOf(v) {
+  let bar = v.el.querySelector(":scope > .sub-status-bar");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.className = "sub-status-bar";
+    v.el.appendChild(bar);
+  }
+  return bar;
+}
+
+function subRender(pid) {
+  const v = views.get(pid);
+  if (!v) return;
+  const map = subStatus.get(pid);
+  const bar = subBarOf(v);
+  bar.innerHTML = "";
+  if (!map || !map.size) { bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden");
+  for (const [sid, item] of map) {
+    const row = document.createElement("div");
+    row.className = "sub-status-item" + (item.state ? " " + item.state : "");
+    row.innerHTML =
+      '<span class="sub-dot"></span>' +
+      '<span class="sub-txt">' + escapeHtml(item.name || "子 Agent") + "</span>" +
+      '<span class="sub-state">' + escapeHtml(item.label || "运行中") + "</span>";
+    bar.appendChild(row);
+  }
+  v.el.scrollTop = v.el.scrollHeight;
+}
+
+function subSet(pid, sid, patch, gen) {
+  if (!pid || !sid) return;
+  let map = subStatus.get(pid);
+  if (!map) { map = new Map(); subStatus.set(pid, map); }
+  const cur = map.get(sid) || { name: "", label: "运行中", state: "running", gen: 0 };
+  // generation 保护：忽略旧实例（gen 更小）的迟到事件，避免覆盖新任务状态。
+  const g = (typeof gen === "number") ? gen : cur.gen;
+  if (g <cur.gen) return;
+  Object.assign(cur, patch);
+  cur.gen = g;
+  map.set(sid, cur);
+  subRender(pid);
+}
+
+function subRemove(pid, sid, gen) {
+  const map = subStatus.get(pid);
+  if (!map) return;
+  const cur = map.get(sid);
+  if (!cur) return;
+  // generation 保护：仅当事件属于当前实例才移除，防止旧 closed 误删新运行。
+  if (typeof gen === "number" && gen < cur.gen) return;
+  map.delete(sid);
+  subRender(pid);
+}
+
+listen("agent://sub-start", (e) => {
+  const p = e.payload || {};
+  subSet(p.project_id, p.sub_id, { name: p.name, label: "运行中", state: "running" }, p.run_generation);
+});
+listen("agent://sub-done", (e) => {
+  const p = e.payload || {};
+  const ok = !!p.ok;
+  let label = "失败";
+  if (ok) label = "已完成";
+  else if (p.reason === "cancelled") label = "已取消";
+  else if (p.reason === "format") label = "格式失败";
+  else if (p.reason === "empty") label = "空回复";
+  subSet(p.project_id, p.sub_id, {
+    name: p.name,
+    label: label,
+    state: ok ? "done" : "failed",
+  }, p.run_generation);
+});
+listen("agent://sub-closed", (e) => {
+  const p = e.payload || {};
+  subRemove(p.project_id, p.sub_id, p.run_generation);
+});
+listen("agent://sub-format-error", (e) => {
+  const p = e.payload || {};
+  subSet(p.project_id, p.sub_id, {
+    name: p.name || p.sub_name,
+    label: "格式错误",
+    state: "failed",
+  }, p.run_generation);
+});
+listen("agent://sub-handoff", (e) => {
+  const p = e.payload || {};
+  subSet(p.project_id, p.sub_id, {
+    name: p.name || p.sub_name,
+    label: "已交接(" + (p.count || 0) + ")",
+    state: "running",
+  }, p.run_generation);
 });
 
 document.getElementById("new-project").onclick = async () => {

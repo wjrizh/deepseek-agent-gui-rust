@@ -106,8 +106,19 @@ Tools:
   <parameter name="old_string">EXACT OLD TEXT</parameter>
   <parameter name="new_string">NEW TEXT</parameter>
   <parameter name="replace_all">false</parameter>  (optional, default false)
+- task_complete: 声明任务已完成。完成任务时**必须**调用本工具，否则系统会认为你的输出可能被截断/限流而未完成。
+  <parameter name="summary">一句话总结本次完成的工作</parameter>
+- ask_user：当你需要用户澄清/补充信息才能继续时调用，不要用普通文字提问。
+  参数：question（要问用户的问题）。
+  调用后本轮会结束并等待用户回答。
+  示例：
+  <invoke name="ask_user">
+  <parameter name="question">你希望我改动哪个文件？</parameter>
+  </invoke>
+- request_context_compaction: 请求上下文压缩。仅当上下文即将不足、需要压缩后进入新会话继续时调用（不要频繁调用）。
+  <parameter name="reason">一句话说明为何需要压缩</parameter>  (可选)
 
-Important: the only valid tool names are execute_command, upload_file, read_file, write_file, edit_file, and sub_agent. 主 agent 没有 browser 工具；需要浏览器操作时，用 sub_agent 派一个 browser 子 agent。
+Important: the only valid tool names are execute_command, upload_file, read_file, write_file, edit_file, sub_agent, task_complete, and request_context_compaction. 主 agent 没有 browser 工具；需要浏览器操作时，用 sub_agent 派一个 browser 子 agent。
 
 Rules:
 - If no tool call is needed, do not output any DSML / tool_calls / invoke / parameter tags at all. Output plain normal text only.
@@ -119,6 +130,8 @@ Rules:
 - 主 agent 没有 browser 工具；需要浏览器时用 sub_agent 派 browser 子 agent。
 - 你是主 agent，只做总体计划与实施。附属任务（尤其浏览器操作）派给命名且职责明确的子 agent。
 - 子 agent 失败时由你决定是否重试（再次用同名 sub_agent 即续跑），最多 3 次；3 次仍失败，直接给用户可执行的解决方案。
+- 完成任务时必须调用 task_complete 并提供 summary；未调用则系统会提示你可能被截断或限流，并可能判为未完成。
+- 只有在确实需要压缩上下文时才调用 request_context_compaction。
 - 精简回复节省token."#;
 
 pub const FORMAT_ERROR_PROMPT: &str = r#"格式错误。

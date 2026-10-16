@@ -305,6 +305,7 @@ window.__hasUnreadAgentDiffUnder = (dirRel) => {
   return false;
 };
 window.__openAgentDiff = openAgentDiff;
+window.__ideOpenFile = (rel) => { if (rel) openFile(rel, String(rel).split("/").pop()); };
 
 // —— 源代码管理（Git） ——
 let gitState = null;         // 最近一次 GitStatus

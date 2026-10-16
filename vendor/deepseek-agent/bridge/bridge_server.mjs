@@ -14,8 +14,40 @@ if (!PROFILE_DIR) { console.error('LIGONG_PROFILE_DIR not set'); process.exit(1)
 let context, page;
 let captured = null;
 let stopRequested = false;
+// P1-2：本轮 ask 的捕获窗口。只接受窗口期间的 /chat/completion 响应。
+let askWindow = null; // { startedAt, sessionId, promptTail }
 
 function log(...a) { console.error('[bridge]', ...a); }
+
+// ---- 选择器诊断（P1-1）----
+// 记录每个功能选择器组的命中/失败；连续失败达阈值发 SELECTOR-WARNING。
+// 纯诊断，不改协议、不影响执行结果。
+const SELECTOR_MISS_THRESHOLD = 3;
+const _selDiag = new Map(); // key: 功能名 -> { miss, lastDetail }
+let pendingWarnings = []; // 本轮累积的选择器告警，随 ask 响应带出
+
+function noteSelector(func, hit, detail) {
+  let d = _selDiag.get(func);
+  if (!d) { d = { miss: 0, lastDetail: '' }; _selDiag.set(func, d); }
+  if (hit > 0) {
+    if (d.miss > 0) log('selector recovered:', func, 'hits=', hit);
+    d.miss = 0;
+    d.lastDetail = '';
+    return;
+  }
+  d.miss += 1;
+  d.lastDetail = detail || '';
+  log('selector miss:', func, '(' + d.miss + '/' + SELECTOR_MISS_THRESHOLD + ')', d.lastDetail);
+  if (d.miss === SELECTOR_MISS_THRESHOLD) {
+    const w = {
+      func,
+      url: (() => { try { return page.url(); } catch { return ''; } })(),
+      detail: d.lastDetail,
+    };
+    log('SELECTOR-WARNING', JSON.stringify(w));
+    pendingWarnings.push(w);
+  }
+}
 
 // 停不下来 = 还在生成。对齐原文的多个选择器。
 function stopButton() {
@@ -36,7 +68,13 @@ async function setToggle(label, want) {
   const pressed = (await el.getAttribute('aria-pressed')) === 'true';
   if (pressed !== !!want) {
     await el.click();
-    await page.waitForTimeout(400);
+    // P1-3：优先等 aria-pressed 到位，最多 400ms（超时兜底）。
+    const deadline = Date.now() + 400;
+    while (Date.now() <deadline) {
+      const now = (await el.getAttribute('aria-pressed')) === 'true';
+      if (now === !!want) break;
+      await page.waitForTimeout(50);
+    }
   }
   log('toggle', label, '=>', want, '(now', (await el.getAttribute('aria-pressed')) + ')');
 }
@@ -94,6 +132,17 @@ async function init() {
   page.on('response', (resp) => {
     const u = resp.url();
     if (u.includes('/chat/completion') && resp.request().method() === 'POST') {
+      // P1-2：仅接受本轮 ask 窗口期间的响应。
+      // 窗口未开启（页面加载/空闲）或超时的响应不捕获，避免误捕无关请求。
+      if (!askWindow) {
+        log('skip completion outside ask window:', u);
+        return;
+      }
+      const elapsed = Date.now() - askWindow.startedAt;
+      if (elapsed > 30000) {
+        log('skip completion too late in window (' + elapsed + 'ms):', u);
+        return;
+      }
       if (!captured) { captured = resp; log('captured SSE:', u); }
       if (process.env.LIGONG_DUMP_SSE) {
         resp.text().then((t) => {
@@ -305,7 +354,7 @@ function fileCardSelectors() {
 }
 
 async function listFiles() {
-  return await page.evaluate((sels) => {
+  const out = await page.evaluate((sels) => {
     const seen = new Set();
     const out = [];
     for (const sel of sels) {
@@ -320,6 +369,8 @@ async function listFiles() {
     }
     return out;
   }, fileCardSelectors());
+  // 注意：文件卡片为空是正常状态（无附件），不据此告警；仅当解析到空文件名时提示。
+  return out;
 }
 
 async function removeFile(name) {
@@ -362,6 +413,9 @@ async function clearFiles() {
 async function ask(prompt, thinking, search, sessionId, parentId, files) {
   captured = null;
   stopRequested = false;
+  // P1-5：捕获窗口延后到 Enter 前一刻开启，避免误捕 Enter 之前
+  // （openSession/toggle/上传等）触发的无关 /chat/completion 请求。
+  askWindow = null;
   if (sessionId && !isValidSessionId(sessionId)) {
     log('warn: invalid session id, starting fresh:', sessionId);
     sessionId = null;
@@ -369,47 +423,88 @@ async function ask(prompt, thinking, search, sessionId, parentId, files) {
   if (sessionId) await openSession(sessionId); else await gotoBlank();
   await applyToggles(thinking, search);
   if (files && files.length) await uploadFile(files);
-  const box = await page.waitForSelector('textarea', { timeout: 5000 });
+  let box;
+  try {
+    box = await page.waitForSelector('textarea', { timeout: 5000 });
+    noteSelector('input-textarea', 1, 'ask');
+  } catch (e) {
+    noteSelector('input-textarea', 0, 'waitForSelector timeout');
+    throw e;
+  }
+  const preMsgCount = await page.evaluate(() => document.querySelectorAll('.ds-message').length).catch(() => 0);
   await box.fill('');
   await box.fill(prompt);
+  // P1-5：Enter 前一刻开启捕获窗口（与请求发起对齐）。
+  askWindow = {
+    startedAt: Date.now(),
+    sessionId: sessionId || null,
+    promptTail: (prompt || '').slice(-24),
+  };
+  captured = null;
   await page.keyboard.press('Enter');
-  await page.waitForTimeout(1500);
+  // P1-3：优先等到"开始生成"（captured 已捕获 / 停止按钮出现 / 消息数变化），最大仍等 1500ms。
+  {
+    const deadline = Date.now() + 1500;
+    while (Date.now() <deadline) {
+      if (captured) break;
+      if (await stopVisible()) break;
+      const cur = await page.evaluate(() => document.querySelectorAll('.ds-message').length).catch(() => preMsgCount);
+      if (cur !== preMsgCount) break;
+      await page.waitForTimeout(100);
+    }
+  }
 
   let lastLen = 0, stable = 0;
   let sseDone = false;
-  for (let i = 0; i < 300; i++) {
-    await page.waitForTimeout(1000);
+  // P1-4 降频：外层每 500ms 一次 DOM/停止按钮检查（原每 100ms），
+  // 内层 5×100ms 仅检查取消与 SSE 事件，保证亚秒级取消响应。
+  const POLL_SEGS = 5;      // 5 × 100ms = 500ms
+  const MAX_OUTER = 300;    // 最多 ~150s
+  for (let i = 0; i <MAX_OUTER; i++) {
+    let stopHit = false;
+    for (let seg = 0; seg < POLL_SEGS; seg++) {
+      if (stopRequested) { stopHit = true; break; }
+      // 事件优先：SSE 一旦结束立即退出内层（无需等满 500ms）。
+      if (captured && !sseDone) {
+        try {
+          const done = await Promise.race([
+            captured.finished().then(() => true).catch(() => false),
+            new Promise(r => setTimeout(() => r(false), 100)),
+          ]);
+          if (done) { sseDone = true; log('SSE finished at seg', seg); break; }
+        } catch {}
+      } else {
+        await page.waitForTimeout(100);
+      }
+    }
 
-    if (stopRequested) {
+    if (stopHit || stopRequested) {
       try {
         const sb = stopButton();
-        if (await sb.count() && await sb.isVisible()) await sb.click();
+        if (await sb.count() && await sb.isVisible()) {
+          await sb.click();
+        }
       } catch {}
       stopRequested = false;
       break;
     }
 
-    if (captured && !sseDone) {
-      try {
-        const done = await Promise.race([
-          captured.finished().then(() => true).catch(() => false),
-          new Promise(r => setTimeout(() => r(false), 50)),
-        ]);
-        if (done) { sseDone = true; log('SSE finished at iter', i); }
-      } catch {}
-    }
     if (sseDone) {
-      if (!(await stopVisible())) break;
-      return;
+      // SSE 已结束：无论停止按钮是否仍可见，都以已捕获的 SSE 为准（下方统一解析）。
+      break;
     }
 
-    const len = await page.evaluate(() => {
+    // 轮询兜底：每 500ms 查一次 DOM 消息长度与停止按钮。
+    const msgStat = await page.evaluate(() => {
       const m = document.querySelectorAll('.ds-message');
-      return m.length ? m[m.length - 1].innerText.length : 0;
+      return { len: m.length ? m[m.length - 1].innerText.length : 0, count: m.length };
     });
+    if (msgStat.count === 0) noteSelector('message-container', 0, 'no .ds-message');
+    else noteSelector('message-container', msgStat.count, '');
+    const len = msgStat.len;
     if (len > 0 && len === lastLen) stable++; else { stable = 0; lastLen = len; }
     if (await stopVisible()) { stable = 0; continue; }
-    if (stable >= 4 && captured) break;
+    if (stable >= 2 && captured) break;
   }
 
   let responseMessageId = null;
@@ -437,6 +532,7 @@ async function ask(prompt, thinking, search, sessionId, parentId, files) {
     } catch {}
     if (!newSessionId && reqBodySid) newSessionId = reqBodySid;
     if (parsed.think || parsed.answer) {
+      askWindow = null;
       return { ...parsed, responseMessageId, sessionId: newSessionId };
     }
   }
@@ -475,16 +571,51 @@ async function ask(prompt, thinking, search, sessionId, parentId, files) {
   if (extracted) {
     const curSid = sessionIdFromUrl(page.url());
     const m = extracted.match(/<think>([\s\S]*?)<\/think>/);
+    askWindow = null;
     if (m) return { think: m[1].trim(), answer: extracted.replace(/<think>[\s\S]*?<\/think>/, '').trim(), responseMessageId: null, sessionId: curSid };
     return { think: '', answer: extracted, responseMessageId: null, sessionId: curSid };
   }
 
+  askWindow = null;
   throw new Error('no SSE captured');
 }
 
 const rl = readline.createInterface({ input: process.stdin });
+
+// P1-6：登录态弱检测。多个弱信号，失败时标 'unknown'，不轻易判定失效。
+async function detectAuth() {
+  try {
+    const url = page.url() || '';
+    if (/\/sign_in|\/login/i.test(url)) {
+      return { status: 'login', detail: 'url=' + url };
+    }
+    const sig = await page.evaluate(() => {
+      const hasTextarea = !!document.querySelector('textarea');
+      const hasLoginInput = !!document.querySelector('input[type="password"], input[type="tel"], input[name*="phone" i], input[placeholder*="手机"], input[placeholder*="密码"]');
+      const hasLoginBtn = !!document.querySelector('button, div[role="button"]') &&
+        /\u767b\u5f55|\u767b\u5165|\u624b\u673a\u53f7\u767b\u5f55|Sign in|Log in/i.test(document.body ? document.body.innerText.slice(0, 2000) : '');
+      const hasUserMenu = !!document.querySelector('[class*="avatar" i], [class*="user" i], [aria-label*="账户" i], [aria-label*="个人" i]');
+      return { hasTextarea, hasLoginInput, hasLoginBtn, hasUserMenu };
+    });
+    if (sig.hasLoginInput && sig.hasLoginBtn && !sig.hasUserMenu) {
+      return { status: 'login', detail: 'login form detected' };
+    }
+    if (sig.hasTextarea && sig.hasUserMenu) {
+      return { status: 'ok', detail: 'textarea + user menu' };
+    }
+    if (sig.hasTextarea && !sig.hasLoginInput) {
+      return { status: 'ok', detail: 'textarea, no login form' };
+    }
+    return { status: 'unknown', detail: JSON.stringify(sig) };
+  } catch (e) {
+    return { status: 'unknown', detail: String((e && e.message) || e) };
+  }
+}
+
 await init();
-process.stdout.write(JSON.stringify({ ok: true, ready: true }) + '\n');
+let initialAuth = await detectAuth();
+log('auth detect:', JSON.stringify(initialAuth));
+process.stdout.write(JSON.stringify({ ok: true, ready: true, auth: initialAuth }) + '\n');
 
 // toggle 请求走独立即时通道：即便 ask 正在跑，也能立刻作用到浏览器页面。
 // 其余请求进串行队列，避免并发操作页面。
@@ -509,6 +640,11 @@ async function handleSerial(req, rid) {
     if (req.quit) {
       try { await context?.close(); } catch {}
       process.exit(0);
+    }
+    if (req.auth_check) {
+      const a = await detectAuth();
+      process.stdout.write(JSON.stringify({ ok: true, auth: a, req_id: rid }) + '\n');
+      return;
     }
     if (req.message_count !== undefined) {
       const n = await messageCount(req.session_id || null);
@@ -551,6 +687,7 @@ async function handleSerial(req, rid) {
       return;
     }
     const result = await ask(req.prompt, !!req.thinking, !!req.search, req.session_id || null, req.parent_message_id != null ? req.parent_message_id : null, req.files || null);
+    askWindow = null;
     process.stdout.write(JSON.stringify({
       ok: true,
       text: result.answer,
@@ -558,7 +695,9 @@ async function handleSerial(req, rid) {
       message_id: result.responseMessageId != null ? result.responseMessageId : null,
       session_id: result.sessionId || null,
       req_id: rid,
+      warnings: pendingWarnings,
     }) + '\n');
+    pendingWarnings = [];
   } catch (e) {
     process.stdout.write(JSON.stringify({ ok: false, error: String((e && e.message) || e) , req_id: rid}) + '\n');
   }

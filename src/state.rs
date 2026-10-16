@@ -14,7 +14,7 @@ use deepseek_agent::{Config, Runtime};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-pub const BRIDGE_IDLE_SECS: u64 = 30;
+pub const BRIDGE_IDLE_SECS: u64 = 10;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingFile {
@@ -36,6 +36,10 @@ pub struct Session {
     pub free_mode: bool,
     pub pending_files: Vec<PendingFile>,
     pub announced_workdir: Option<String>,
+    /// 压缩交接后等待真实 session UUID 绑定（网页内核 new_session 返回空串时置位）。
+    pub pending_handoff: bool,
+    /// 交接报告文本，待真实 session 绑定后随首轮一并带入（防止空 session 被持久化）。
+    pub pending_report: Option<String>,
 }
 
 pub struct RunCtx {
@@ -48,6 +52,16 @@ pub struct RunCtx {
     pub turn_active: bool,
     /// 当前主 turn 的代数。每次 start_turn 自增；收尾回调只在代数匹配时清理状态。
     pub turn_gen: u64,
+    /// 本轮是否被用户请求取消。为真时收尾不得自动唤起审阅 turn。
+    pub cancel_requested: bool,
+    /// 连续"缺完成信号"计数（出现合法完成信号/工具调用即清零）。
+    pub missing_completion_count: u32,
+    /// 是否因限流挂起（等待 10 分钟重试）。
+    pub rate_limited_suspended: bool,
+    /// 限流等待代数。自增即作废旧的等待任务（人工接管/新 turn 时）。
+    pub rate_limit_wait_seq: u64,
+    /// 限流挂起时下次自动重试的时间（Unix 秒），供前端倒计时。
+    pub rate_limit_retry_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -76,6 +90,12 @@ pub struct SubRunCtx {
     pub attempts: u8,
     pub last_text: Option<String>,
     pub last_ok: Option<bool>,
+    /// 连续"缺完成信号"计数（出现合法完成信号/工具调用即清零）。
+    pub missing_completion_count: u32,
+    /// 是否因限流挂起。
+    pub rate_limited_suspended: bool,
+    /// 最近一次派发的任务文本，供"重试"原样重派。
+    pub last_task: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -105,6 +125,8 @@ pub struct Inner {
     pub account_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     pub init_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     pub bridge_last_used: HashMap<String, Instant>,
+    /// 子 bridge（key = `{account}#sub-{sid}`）上次空闲时间。用于 10s TTL 复用。
+    pub sub_bridge_last_used: HashMap<String, Instant>,
     pub qq: Option<QqHandle>,
     /// IDE 文件监听（外部改动同步）。setup 阶段注入。
     pub ide_watcher: Option<crate::ide::watch::IdeWatcher>,
@@ -143,6 +165,7 @@ impl Default for AppState {
                 account_locks: HashMap::new(),
                 init_locks: HashMap::new(),
                 bridge_last_used: HashMap::new(),
+                sub_bridge_last_used: HashMap::new(),
                 qq: None,
                 ide_watcher: None,
                 sub_runs: HashMap::new(),
@@ -300,6 +323,11 @@ impl AppState {
                 busy: false,
                 turn_active: false,
                 turn_gen: 0,
+                cancel_requested: false,
+                missing_completion_count: 0,
+                rate_limited_suspended: false,
+                rate_limit_wait_seq: 0,
+                rate_limit_retry_at: None,
             },
         );
         drop(inner);
@@ -412,9 +440,12 @@ impl AppState {
     ) -> Result<Arc<BridgeModel>, String> {
         let key = format!("{account}#sub-{sid}");
         {
-            let inner = self.inner.lock().await;
+            let mut inner = self.inner.lock().await;
             if let Some(b) = inner.bridges.get(&key) {
-                return Ok(b.clone());
+                // 复用：刷新空闲时间戳，避免被 idle worker 回收。
+                let b = b.clone();
+                inner.sub_bridge_last_used.insert(key.clone(), Instant::now());
+                return Ok(b);
             }
         }
         let profile = Self::clone_profile(account, sid)?;
@@ -430,19 +461,36 @@ impl AppState {
         let bridge = BridgeModel::launch(&profile, state_file.as_deref(), true)
             .await
             .map_err(|e| format!("启动子 bridge 失败: {e}"))?;
-        self.inner
-            .lock()
-            .await
-            .bridges
-            .insert(key, bridge.clone());
+        // P1-6：子 bridge 同账号登录态失效时明确报错。
+        let auth = bridge.auth_status().await;
+        if auth == "login" {
+            bridge.shutdown().await;
+            return Err(format!(
+                "账号 {account} 登录态已失效，请重新登录后重试子 agent",
+            ));
+        }
+        {
+            let mut inner = self.inner.lock().await;
+            inner.bridges.insert(key.clone(), bridge.clone());
+            inner.sub_bridge_last_used.insert(key, Instant::now());
+        }
         Ok(bridge)
     }
 
-    /// 释放子 bridge 与其 profile。
+    /// 标记子 bridge 空闲（不再立即销毁）。统一由 idle worker 在 TTL 后回收，
+    /// 保留 profile 以支持短时间内同名重派复用（免重启 chromium）。
     pub async fn release_sub_bridge(&self, account: &str, sid: &str) {
+        let key = format!("{account}#sub-{sid}");
+        let mut inner = self.inner.lock().await;
+        inner.sub_bridge_last_used.insert(key, Instant::now());
+    }
+
+    /// 立即销毁子 bridge 与其 profile（删除子 agent / 清理账号等场景）。
+    pub async fn destroy_sub_bridge(&self, account: &str, sid: &str) {
         let key = format!("{account}#sub-{sid}");
         let bridge = {
             let mut inner = self.inner.lock().await;
+            inner.sub_bridge_last_used.remove(&key);
             inner.bridges.remove(&key)
         };
         if let Some(b) = bridge {
@@ -479,6 +527,14 @@ impl AppState {
         let bridge = BridgeModel::launch(&profile_dir, state_file.as_deref(), false)
             .await
             .map_err(|e| format!("启动 bridge 失败: {e}"))?;
+        // P1-6：启动后若检测到登录态失效，明确报错并回收 bridge。
+        let auth = bridge.auth_status().await;
+        if auth == "login" {
+            bridge.shutdown().await;
+            return Err(format!(
+                "账号 {account} 登录态已失效，请重新登录该账号",
+            ));
+        }
         self.inner.lock().await.bridges.insert(account.to_string(), bridge.clone());
         Ok(bridge)
     }
@@ -526,6 +582,52 @@ impl AppState {
             guard = inner.lock().await;
             closed += 1;
         }
+        // 子 bridge：超过 TTL 且对应 sid 非运行中 → 回收 bridge 并删 profile。
+        let stale_sub: Vec<String> = guard
+            .sub_bridge_last_used
+            .iter()
+            .filter(|(_, t)| now.duration_since(**t) >= max_idle)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale_sub {
+            let sid = key.split_once("#sub-").map(|(_, s)| s.to_string());
+            let running = sid
+                .as_deref()
+                .map(|s| {
+                    guard.sub_runs.get(s).map(|r| {
+                        matches!(
+                            r.status,
+                            SubRunStatus::Starting | SubRunStatus::Running
+                        )
+                    }).unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if running {
+                // 运行中：刷新时间戳，跳过回收。
+                guard.sub_bridge_last_used.insert(key, Instant::now());
+                continue;
+            }
+            let bridge = guard.bridges.remove(&key);
+            guard.sub_bridge_last_used.remove(&key);
+            let account = key.split_once("#sub-").map(|(a, _)| a.to_string());
+            drop(guard);
+            if let Some(bridge) = bridge {
+                bridge.shutdown().await;
+            }
+            // 删 profile 目录。
+            if let (Some(account), Some(sid)) = (account, sid) {
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                let sub_dir = home
+                    .join(".deepseek-agent")
+                    .join("accounts")
+                    .join(&account)
+                    .join("sub")
+                    .join(&sid);
+                let _ = std::fs::remove_dir_all(&sub_dir);
+            }
+            guard = inner.lock().await;
+            closed += 1;
+        }
         closed
     }
 
@@ -539,6 +641,7 @@ impl AppState {
             let list = inner.bridges.values().cloned().collect();
             inner.bridges.clear();
             inner.bridge_last_used.clear();
+            inner.sub_bridge_last_used.clear();
             list
         };
         for b in bridges {

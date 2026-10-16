@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 /// 默认的上下文压缩阈值（消息条数）。每项目可在项目设置里单独调整。
 pub const COMPACT_THRESHOLD_DEFAULT: i64 = 300;
 
+/// 每项目子 agent 并发上限的缺省值。
+pub const SUB_LIMIT_DEFAULT: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: String,
@@ -56,6 +59,13 @@ pub struct Project {
     pub sub_accounts: Vec<String>,
     #[serde(default)]
     pub sub_account_limits: std::collections::HashMap<String, u32>,
+    /// 账号池计费口径：permanent（默认，历史绑定长期占用名额）/ active（仅运行中的子 agent 占用）。
+    #[serde(default = "default_sub_account_mode")]
+    pub sub_account_mode: String,
+}
+
+fn default_sub_account_mode() -> String {
+    "permanent".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -77,9 +87,21 @@ pub struct ProjectStore {
     /// 每项目的上下文压缩阈值（消息条数）。缺省为 COMPACT_THRESHOLD_DEFAULT。
     #[serde(default)]
     pub compact_by_project: std::collections::HashMap<String, i64>,
+    /// 每项目子 agent 并发上限。缺省为 SUB_LIMIT_DEFAULT。
+    #[serde(default)]
+    pub max_sub_by_project: std::collections::HashMap<String, u32>,
+    /// 每项目是否预启动主 bridge（默认关，减少启动延迟）。key=project_id。
+    #[serde(default)]
+    pub warmup_by_project: std::collections::HashMap<String, bool>,
     #[serde(default)]
     pub conversation_seq: u64,
+    /// 存储格式版本号，用于未来迁移与兼容判断。
+    #[serde(default)]
+    pub version: u64,
 }
+
+/// 当前存储格式版本。旧文件缺省为 0，加载后升级为当前值。
+pub const STORE_VERSION: u64 = 1;
 
 fn store_path() -> PathBuf {
     let dir = dirs::home_dir().unwrap_or_default();
@@ -117,6 +139,9 @@ pub struct StoredMessage {
     #[serde(default)]
     pub text: String,
     pub ts: u64,
+    /// 同秒内稳定序号（追加顺序），用于排序去重。旧数据缺省为 0。
+    #[serde(default)]
+    pub seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<ToolRecord>,
 }
@@ -153,10 +178,48 @@ pub fn rename_conversation_file(old_id: &str, new_id: &str) -> Result<(), String
     let new_path = conversation_file(new_id)?;
     if old_path.exists() {
         std::fs::rename(&old_path, &new_path).map_err(|e| e.to_string())?;
+        clear_msg_seq_cache(&old_path);
+        clear_msg_seq_cache(&new_path);
     }
     Ok(())
 }
-/// 追加一条消息到对话文件（JSONL，一行一条）。
+/// 每对话文件的已写行数缓存：避免每次追加都读取整个 JSONL 文件（O(n²)）。
+static MSG_SEQ_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::OnceLock::new();
+
+fn msg_seq_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    MSG_SEQ_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 追加时的下一个稳定序号（文件当前行数）。
+/// 使用内存缓存：首次读取文件计数，之后自增；文件被删除/重命名时清理缓存。
+fn next_message_seq(path: &std::path::Path) -> u64 {
+    let key = path.to_string_lossy().to_string();
+    let mut cache = match msg_seq_cache().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(n) = cache.get(&key) {
+        let next = *n;
+        cache.insert(key, next + 1);
+        return next;
+    }
+    // 首次：读文件计数初始化。
+    let count = match std::fs::read_to_string(path) {
+        Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count() as u64,
+        Err(_) => 0,
+    };
+    cache.insert(key, count + 1);
+    count
+}
+
+/// 清理某对话文件的 seq 缓存（删除/重命名时调用）。
+fn clear_msg_seq_cache(path: &std::path::Path) {
+    if let Ok(mut cache) = msg_seq_cache().lock() {
+        cache.remove(&path.to_string_lossy().to_string());
+    }
+}
+
 pub fn append_message(conv_id: &str, role: &str, text: &str) -> Result<(), String> {
     let path = conversation_file(conv_id)?;
     if let Some(parent) = path.parent() {
@@ -166,6 +229,7 @@ pub fn append_message(conv_id: &str, role: &str, text: &str) -> Result<(), Strin
         role: role.to_string(),
         text: text.to_string(),
         ts: now_secs(),
+        seq: next_message_seq(&path),
         tool: None,
     };
     let mut line = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
@@ -196,6 +260,7 @@ pub fn append_tool(
         role: "tool".to_string(),
         text: String::new(),
         ts: now_secs(),
+        seq: next_message_seq(&path),
         tool: Some(ToolRecord {
             name: name.to_string(),
             command: command.to_string(),
@@ -233,12 +298,15 @@ pub fn load_messages(conv_id: &str) -> Result<Vec<StoredMessage>, String> {
             out.push(m);
         }
     }
+    // 按 (ts, seq) 稳定排序；同秒消息用 seq 保序，旧数据 seq=0 维持原序。
+    out.sort_by(|a, b| a.ts.cmp(&b.ts).then(a.seq.cmp(&b.seq)));
     Ok(out)
 }
 
 /// 删除对话文件（不存在也视为成功）。
 pub fn delete_conversation_file(conv_id: &str) -> Result<(), String> {
     let path = conversation_file(conv_id)?;
+    clear_msg_seq_cache(&path);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -270,6 +338,9 @@ impl ProjectStore {
             Err(_) => Self::default(),
         };
         bump_conversation_seq(&mut store);
+        if store.version == 0 {
+            store.version = STORE_VERSION;
+        }
         store
     }
 
@@ -286,7 +357,27 @@ impl ProjectStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        // 写前备份上一份（保留最近一次良好状态，损坏时可回退）。
+        // 节流：距上次备份 <5s 则跳过，避免高频 save 反复复制整个 JSON。
+        if path.is_file() {
+            let now = std::time::Instant::now();
+            let should_backup = {
+                static LAST_BACKUP: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
+                    std::sync::OnceLock::new();
+                let m = LAST_BACKUP.get_or_init(|| std::sync::Mutex::new(None));
+                let mut g = match m.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                let ok = g.map(|t| now.duration_since(t) >= std::time::Duration::from_secs(5)).unwrap_or(true);
+                if ok { *g = Some(now); }
+                ok
+            };
+            if should_backup {
+                let bak = path.with_extension("json.bak");
+                let _ = std::fs::copy(&path, &bak);
+            }
+        }
+        let mut snapshot = self.clone();
+        snapshot.version = STORE_VERSION;
+        let json = serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
@@ -341,6 +432,27 @@ impl ProjectStore {
             .insert(project_id.to_string(), n);
     }
 
+    pub fn max_sub_of(&self, project_id: &str) -> u32 {
+        self.max_sub_by_project
+            .get(project_id)
+            .copied()
+            .filter(|v| *v > 0)
+            .unwrap_or(SUB_LIMIT_DEFAULT)
+    }
+
+    pub fn set_max_sub_of(&mut self, project_id: &str, n: u32) {
+        self.max_sub_by_project
+            .insert(project_id.to_string(), n);
+    }
+
+    pub fn warmup_of(&self, project_id: &str) -> bool {
+        self.warmup_by_project.get(project_id).copied().unwrap_or(false)
+    }
+
+    pub fn set_warmup_of(&mut self, project_id: &str, on: bool) {
+        self.warmup_by_project.insert(project_id.to_string(), on);
+    }
+
     pub fn project(&self, id: &str) -> Option<&Project> {
         self.projects.iter().find(|p| p.id == id)
     }
@@ -390,6 +502,7 @@ impl ProjectStore {
             sub_agents: Vec::new(),
             sub_accounts: Vec::new(),
             sub_account_limits: std::collections::HashMap::new(),
+            sub_account_mode: "permanent".to_string(),
         };
         self.projects.insert(0, p.clone());
         self.active_project = Some(p.id.clone());
@@ -588,6 +701,23 @@ impl ProjectStore {
     ) -> bool {
         match self.project_mut(project_id) {
             Some(p) => { p.sub_account_limits = limits; true }
+            None => false,
+        }
+    }
+
+    pub fn sub_account_mode_of(&self, project_id: &str) -> String {
+        self.project(project_id)
+            .map(|p| if p.sub_account_mode.is_empty() { "permanent".to_string() } else { p.sub_account_mode.clone() })
+            .unwrap_or_else(|| "permanent".to_string())
+    }
+
+    pub fn set_sub_account_mode(&mut self, project_id: &str, mode: &str) -> bool {
+        let mode = match mode {
+            "active" => "active",
+            _ => "permanent",
+        };
+        match self.project_mut(project_id) {
+            Some(p) => { p.sub_account_mode = mode.to_string(); true }
             None => false,
         }
     }

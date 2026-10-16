@@ -85,5 +85,6 @@ function getProjectId() { return _projectId; }
 
 // 确保 Agent 面板已初始化（首次切到对话时）。
 export function ensureAgent() {
-  if (!isAgentReady()) initAgent({ projectId: getProjectId(), onBusy });
+  // initAgent 内部对同项目幂等、异项目自动重装（卸载旧监听）。
+  initAgent({ projectId: getProjectId(), onBusy });
 }

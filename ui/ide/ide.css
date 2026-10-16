@@ -994,7 +994,10 @@ html, body {
 .ag-tool-body { display: none; }
 .ag-tool.expanded .ag-tool-body { display: block; }
 .ag-tool-name { color: #4ec9b0; font-weight: 600; }
-.ag-tool-status { color: #888; margin-left: auto; font-size: 11px; }
+.ag-tool-status { color: #888; font-size: 11px; }
+.ag-tool-actions { margin-left: auto; display: inline-flex; gap: 6px; }
+.ag-tool-act { font-size: 11px; padding: 1px 6px; background: transparent; color: #4ec9b0; border: 0.5px solid #3a3a3a; border-radius: 4px; cursor: pointer; }
+.ag-tool-act:hover { background: #2a2d2e; }
 .ag-tool.done .ag-tool-status { color: #6a9955; }
 .ag-tool.error .ag-tool-status { color: #f14c4c; }
 .ag-tool-cmd {

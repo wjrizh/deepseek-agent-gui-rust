@@ -14,6 +14,50 @@ fn save_projects(inner: &crate::state::Inner) -> Result<(), String> {
     inner.projects.save()
 }
 
+/// P2-3 错误分层：把任意错误串归类，产出结构化字段（保留原始 message 兼容旧前端）。
+/// 返回 (category, user_message, retryable)。
+pub fn classify_error(msg: &str) -> (&'static str, String, bool) {
+    let m = msg.to_lowercase();
+    let has = |k: &str| m.contains(k);
+    if has("登录") || has("login") || has("auth") || has("未登录") || has("登录态") {
+        ("auth", "账号登录态已失效，请重新登录该账号后重试。".to_string(), false)
+    } else if has("取消") || has("cancel") {
+        ("cancelled", "已取消。".to_string(), true)
+    } else if has("超时") || has("timeout") || has("timed out") || has("连接") || has("network")
+        || has("econn") || has("socket") || has("dns") || has("bridge") || has("启动")
+    {
+        ("network", format!("网络或内核连接异常，可稍后重试。（{msg}）"), true)
+    } else if has("限流") || has("rate") || has("429") || has("额度") || has("quota") || has("too many") {
+        ("rate_limit", "请求过于频繁或额度受限，请稍后重试。".to_string(), true)
+    } else if has("格式") || has("format") || has("解析") || has("parse") {
+        ("format", "模型输出格式异常，可重试本轮。".to_string(), true)
+    } else if has("审批") || has("approval") || has("拒绝") || has("denied") {
+        ("approval", "工具调用被拒绝或审批未通过。".to_string(), false)
+    } else {
+        ("unknown", msg.to_string(), true)
+    }
+}
+
+/// 构造统一的 `agent://error` 载荷（分层字段 + 原始 message）。
+pub fn error_payload(
+    project_id: &str,
+    message: &str,
+    account: Option<&str>,
+    sub_id: Option<&str>,
+) -> serde_json::Value {
+    let (category, user_message, retryable) = classify_error(message);
+    serde_json::json!({
+        "project_id": project_id,
+        "category": category,
+        "user_message": user_message,
+        "technical_message": message,
+        "retryable": retryable,
+        "account": account.unwrap_or(""),
+        "sub_id": sub_id.unwrap_or(""),
+        "message": message,
+    })
+}
+
 fn delete_gap() -> std::time::Duration {
     let ms = 3000 + {
         let nanos = std::time::SystemTime::now()
@@ -302,17 +346,31 @@ pub async fn delete_project(
     save_projects(&inner)?;
     inner.running.remove(&id);
     // 清理该项目残留的子 agent 运行态与待注入结果。
+    // 仅立即释放"非运行中"的 bridge/profile；仍在运行的任务已收到 cancel，
+    // 由其收尾的 3s 清理任务负责释放，避免任务还在用 bridge 时被切断（删除屏障）。
     let stale_sub: Vec<(String, String)> = inner
         .sub_runs
         .values()
-        .filter(|r| r.project_id == id)
+        .filter(|r| {
+            r.project_id == id
+                && !matches!(
+                    r.status,
+                    crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+                )
+        })
         .map(|r| (r.account.clone(), r.profile_id.clone()))
         .collect();
-    inner.sub_runs.retain(|_, r| r.project_id != id);
+    inner.sub_runs.retain(|_, r| {
+        !(r.project_id == id
+            && !matches!(
+                r.status,
+                crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+            ))
+    });
     inner.pending_sub_results.remove(&id);
     drop(inner);
     for (acc, prof) in stale_sub {
-        state.release_sub_bridge(&acc, &prof).await;
+        state.destroy_sub_bridge(&acc, &prof).await;
     }
     deepseek_agent::agent::browser::shutdown_key(&id).await;
     let _ = app.emit("agent://projects-changed", ());
@@ -356,9 +414,19 @@ pub async fn open_project(
             ctx.session.prompt_sent = false;
         }
     }
+    let warmup = inner.projects.warmup_of(&id);
     save_projects(&inner)?;
     drop(inner);
     let _ = app.emit("agent://projects-changed", ());
+    // P1-2：可选预热（默认关）。开启后打开项目即后台预启动主 bridge，减少首字延迟。
+    if warmup {
+        let app2 = app.clone();
+        let pid = id.clone();
+        tauri::async_runtime::spawn(async move {
+            let st = app2.state::<AppState>();
+            let _ = st.ensure_run_ctx(&pid).await;
+        });
+    }
     Ok(())
 }
 
@@ -369,6 +437,86 @@ pub async fn list_sub_agents(
 ) -> Result<Vec<crate::projects::SubAgent>, String> {
     let inner = state.inner.lock().await;
     Ok(inner.projects.sub_agents_of(&project_id))
+}
+
+/// 运行中子 agent 状态快照，供主 UI / IDE 初始化状态条（与 sub-* 事件同一状态集）。
+#[tauri::command]
+pub async fn list_sub_runs(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let inner = state.inner.lock().await;
+    Ok(collect_sub_runs(&inner, &project_id))
+}
+
+fn collect_sub_runs(inner: &crate::state::Inner, project_id: &str) -> Vec<serde_json::Value> {
+    use crate::state::SubRunStatus;
+    let mut out = Vec::new();
+    for r in inner.sub_runs.values() {
+        if r.project_id != project_id {
+            continue;
+        }
+        let status = match r.status {
+            SubRunStatus::Starting => "starting",
+            SubRunStatus::Running => "running",
+            SubRunStatus::Succeeded => "succeeded",
+            SubRunStatus::Failed => "failed",
+            SubRunStatus::Cancelled => "cancelled",
+            SubRunStatus::Closed => "closed",
+        };
+        out.push(serde_json::json!({
+            "project_id": r.project_id,
+            "sub_id": r.sid,
+            "name": r.name,
+            "duty": r.duty,
+            "agent_type": r.agent_type,
+            "account": r.account,
+            "status": status,
+            "run_generation": r.run_generation,
+            "elapsed_ms": r.started_at.elapsed().as_millis() as u64,
+            "last_ok": r.last_ok,
+            "last_text": r.last_text,
+        }));
+    }
+    out
+}
+
+/// IDE Agent 面板初始化：主 turn 运行态 + 子 agent 快照，一次拿全。
+#[tauri::command]
+pub async fn get_project_runtime(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let inner = state.inner.lock().await;
+    let (busy, turn_active, turn_gen, suspended, retry_at) = inner
+        .running
+        .get(&project_id)
+        .map(|c| {
+            (
+                c.busy,
+                c.turn_active,
+                c.turn_gen,
+                c.rate_limited_suspended,
+                c.rate_limit_retry_at,
+            )
+        })
+        .unwrap_or((false, false, 0, false, None));
+    let pending = inner
+        .pending_sub_results
+        .get(&project_id)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let sub_runs = collect_sub_runs(&inner, &project_id);
+    Ok(serde_json::json!({
+        "project_id": project_id,
+        "busy": busy,
+        "turn_active": turn_active,
+        "turn_gen": turn_gen,
+        "rate_limited_suspended": suspended,
+        "next_retry_at": retry_at,
+        "pending_sub_results": pending,
+        "sub_runs": sub_runs,
+    }))
 }
 
 #[tauri::command]
@@ -415,6 +563,31 @@ pub async fn set_sub_account_limits(
     {
         let mut inner = state.inner.lock().await;
         inner.projects.set_sub_account_limits(&project_id, limits);
+        let _ = inner.projects.save();
+    }
+    let _ = app.emit("agent://projects-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_sub_account_mode(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let inner = state.inner.lock().await;
+    Ok(inner.projects.sub_account_mode_of(&project_id))
+}
+
+#[tauri::command]
+pub async fn set_sub_account_mode(
+    project_id: String,
+    mode: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    {
+        let mut inner = state.inner.lock().await;
+        inner.projects.set_sub_account_mode(&project_id, &mode);
         let _ = inner.projects.save();
     }
     let _ = app.emit("agent://projects-changed", ());
@@ -481,23 +654,37 @@ pub async fn remove_sub_account(
             }
         }
     }
+    // 仅立即释放"非运行中"的子 bridge/profile；仍在运行的任务已收到 cancel，
+    // 由其收尾的 3s 清理任务负责释放，避免任务还在用 bridge 时被切断（删除屏障）。
     let keys: Vec<(String, String)> = {
         let inner = state.inner.lock().await;
         inner
             .sub_runs
             .values()
-            .filter(|r| r.project_id == project_id && r.account == account)
+            .filter(|r| {
+                r.project_id == project_id
+                    && r.account == account
+                    && !matches!(
+                        r.status,
+                        crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+                    )
+            })
             .map(|r| (r.account.clone(), r.profile_id.clone()))
             .collect()
     };
     for (acc, pid_profile) in keys {
-        state.release_sub_bridge(&acc, &pid_profile).await;
+        state.destroy_sub_bridge(&acc, &pid_profile).await;
     }
     {
         let mut inner = state.inner.lock().await;
-        inner
-            .sub_runs
-            .retain(|_, r| !(r.project_id == project_id && r.account == account));
+        inner.sub_runs.retain(|_, r| {
+            !(r.project_id == project_id
+                && r.account == account
+                && !matches!(
+                    r.status,
+                    crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+                ))
+        });
     }
     let _ = app.emit(
         "agent://sub-agents-changed",
@@ -591,6 +778,191 @@ pub async fn delete_sub_agent_conv(
     }
     let _ = app.emit("agent://sub-agents-changed", serde_json::json!({ "project_id": project_id }));
     Ok(())
+}
+
+/// 停止子 agent 的当前运行实例（保留其定义与会话，可稍后重试/继续）。
+#[tauri::command]
+pub async fn stop_sub_agent(
+    project_id: String,
+    sub_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let cancelled = {
+        let inner = state.inner.lock().await;
+        match inner.sub_runs.get(&sub_id) {
+            Some(r) if matches!(
+                r.status,
+                crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+            ) => {
+                r.cancel.cancel();
+                true
+            }
+            _ => false,
+        }
+    };
+    if cancelled {
+        let _ = app.emit("agent://sub-done", serde_json::json!({
+            "project_id": project_id,
+            "sub_id": sub_id,
+            "ok": false,
+            "reason": "cancelled",
+        }));
+    }
+    Ok(())
+}
+
+fn sub_agent_of(
+    inner: &crate::state::Inner,
+    project_id: &str,
+    sub_id: &str,
+) -> Result<crate::projects::SubAgent, String> {
+    inner
+        .projects
+        .sub_agents_of(project_id)
+        .into_iter()
+        .find(|s| s.id == sub_id)
+        .ok_or_else(|| "子 agent 不存在".to_string())
+}
+
+async fn dispatch_sub_agent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+    name: String,
+    duty: String,
+    task: String,
+    agent_type: String,
+) -> Result<(), String> {
+    {
+        let inner = state.inner.lock().await;
+        let limit = inner.projects.max_sub_of(&project_id) as usize;
+        let running = inner
+            .sub_runs
+            .values()
+            .filter(|r| {
+                r.project_id == project_id
+                    && matches!(
+                        r.status,
+                        crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
+                    )
+                    && !r.rate_limited_suspended
+            })
+            .count();
+        if running >= limit {
+            return Err(format!("当前已有 {limit} 个子 agent 在运行（并发上限）"));
+        }
+    }
+    let spec = crate::subagent::SubAgentSpec {
+        project_id,
+        name,
+        duty,
+        task,
+        agent_type,
+    };
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::subagent::run_subagent(app, spec).await;
+    });
+    Ok(())
+}
+
+/// 重试：用原任务文本、复用现有会话重新派发。
+#[tauri::command]
+pub async fn retry_sub_agent(
+    project_id: String,
+    sub_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (name, duty, agent_type, last_task) = {
+        let inner = state.inner.lock().await;
+        let sa = sub_agent_of(&inner, &project_id, &sub_id)?;
+        let last_task = inner
+            .sub_runs
+            .get(&sub_id)
+            .map(|r| r.last_task.clone())
+            .filter(|t| !t.trim().is_empty())
+            .ok_or("该子 agent 无可重试的任务记录")?;
+        (
+            sa.name,
+            sa.duty,
+            inner
+                .sub_runs
+                .get(&sub_id)
+                .map(|r| r.agent_type.clone())
+                .unwrap_or_else(|| "general".to_string()),
+            last_task,
+        )
+    };
+    dispatch_sub_agent(app, state, project_id, name, duty, last_task, agent_type).await
+}
+
+/// 继续：在现有会话上用新任务续跑。
+#[tauri::command]
+pub async fn continue_sub_agent(
+    project_id: String,
+    sub_id: String,
+    task: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if task.trim().is_empty() {
+        return Err("继续任务的内容不能为空".into());
+    }
+    let (name, duty, agent_type) = {
+        let inner = state.inner.lock().await;
+        let sa = sub_agent_of(&inner, &project_id, &sub_id)?;
+        (
+            sa.name,
+            sa.duty,
+            inner
+                .sub_runs
+                .get(&sub_id)
+                .map(|r| r.agent_type.clone())
+                .unwrap_or_else(|| "general".to_string()),
+        )
+    };
+    dispatch_sub_agent(app, state, project_id, name, duty, task, agent_type).await
+}
+
+/// 新会话重试：清空当前 active 会话后，用原任务重新派发。
+#[tauri::command]
+pub async fn retry_sub_agent_new_conv(
+    project_id: String,
+    sub_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (name, duty, agent_type, last_task) = {
+        let mut inner = state.inner.lock().await;
+        let sa = sub_agent_of(&inner, &project_id, &sub_id)?;
+        let last_task = inner
+            .sub_runs
+            .get(&sub_id)
+            .map(|r| r.last_task.clone())
+            .filter(|t| !t.trim().is_empty())
+            .ok_or("该子 agent 无可重试的任务记录")?;
+        // 清空 active 标记，使 resolve_session 新建会话。
+        if let Some(p) = inner.projects.project_mut(&project_id) {
+            if let Some(s) = p.sub_agents.iter_mut().find(|s| s.id == sub_id) {
+                for c in s.conversations.iter_mut() {
+                    c.is_active = false;
+                }
+            }
+        }
+        let _ = inner.projects.save();
+        (
+            sa.name,
+            sa.duty,
+            inner
+                .sub_runs
+                .get(&sub_id)
+                .map(|r| r.agent_type.clone())
+                .unwrap_or_else(|| "general".to_string()),
+            last_task,
+        )
+    };
+    dispatch_sub_agent(app, state, project_id, name, duty, last_task, agent_type).await
 }
 
 #[tauri::command]
@@ -758,9 +1130,18 @@ pub async fn start_turn(
         if ctx.turn_active {
             return Err("该项目正在处理中".into());
         }
+        // 人工接管：若此前因限流挂起等待自动重试，本次用户输入直接接管，
+        // 清除挂起并作废等待任务（seq 自增）。
+        if ctx.rate_limited_suspended {
+            ctx.rate_limited_suspended = false;
+            ctx.missing_completion_count = 0;
+            ctx.rate_limit_wait_seq = ctx.rate_limit_wait_seq.wrapping_add(1);
+            ctx.rate_limit_retry_at = None;
+        }
         ctx.busy = true;
         ctx.turn_active = true;
         ctx.turn_gen = ctx.turn_gen.wrapping_add(1);
+        ctx.cancel_requested = false;
         let c = CancellationToken::new();
         ctx.cancel = Some(c.clone());
         (c, ctx.turn_gen)
@@ -792,17 +1173,25 @@ pub async fn start_turn(
                     )
             });
             let mut is_current = false;
+            let mut was_cancelled = false;
             if let Some(ctx) = inner.running.get_mut(&pid) {
                 if ctx.turn_gen == my_gen {
                     is_current = true;
+                    was_cancelled = ctx.cancel_requested;
                     ctx.cancel = None;
                     ctx.turn_active = false;
-                    ctx.busy = has_running_sub;
+                    // 限流挂起等待重试期间，仍视为"进行中"，保持停止按钮可用。
+                    ctx.busy = has_running_sub || ctx.rate_limited_suspended;
+                    ctx.cancel_requested = false;
                 }
             }
-            let pending = if is_current {
+            // 被用户取消的 turn：丢弃本轮 pending，不再自动唤起审阅 turn。
+            let pending = if is_current && !was_cancelled {
                 inner.pending_sub_results.remove(&pid).unwrap_or_default()
             } else {
+                if is_current {
+                    inner.pending_sub_results.remove(&pid);
+                }
                 Vec::new()
             };
             (pending, has_running_sub, is_current)
@@ -818,10 +1207,7 @@ pub async fn start_turn(
         if !pending.is_empty() {
             let mut block = String::new();
             for r in pending {
-                block.push_str(&format!(
-                    "\n<sub_agent_result name=\"{}\" ok=\"{}\">\n{}\n</sub_agent_result>\n",
-                    r.name, r.ok, r.text
-                ));
+                block.push_str(&crate::subagent::format_sub_result(&r.name, r.ok, &r.text));
             }
             block.push_str(&format!("\n{}\n", runner::SUB_REVIEW_PROMPT));
             let f = {
@@ -837,9 +1223,13 @@ pub async fn start_turn(
                 let _ = app2.emit("agent://done", serde_json::json!({ "project_id": pid }));
             }
             Err(e) => {
+                let account = {
+                    let inner = state.inner.lock().await;
+                    inner.projects.project(&pid).map(|p| p.account.clone()).unwrap_or_default()
+                };
                 let _ = app2.emit(
                     "agent://error",
-                    serde_json::json!({ "project_id": pid, "message": e }),
+                    error_payload(&pid, &e, Some(&account), None),
                 );
             }
         }
@@ -860,7 +1250,7 @@ pub async fn start_turn(
 }
 
 #[tauri::command]
-pub async fn interrupt(project_id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn interrupt(project_id: String, state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
     let (cancel, model) = {
         let inner = state.inner.lock().await;
         match inner.running.get(&project_id) {
@@ -887,8 +1277,36 @@ pub async fn interrupt(project_id: String, state: State<'_, AppState>) -> Result
             }
         }
     }
-    // 不在此处修改 turn_active / cancel：由 run_turn 收尾回调（校验 generation）统一清理，
-    // 避免旧 turn 尚未退出时就允许新 turn 启动，导致两个主 turn 并存。
+    // 标记用户已请求取消：收尾时据此丢弃 pending、不再自动唤起审阅 turn。
+    // 仍不在此处修改 turn_active / cancel，由 run_turn 收尾回调（校验 generation）统一清理。
+    let mut cancelled_suspend = false;
+    {
+        let mut inner = state.inner.lock().await;
+        if let Some(ctx) = inner.running.get_mut(&project_id) {
+            if ctx.turn_active {
+                ctx.cancel_requested = true;
+            }
+            // 限流挂起等待中：无活跃 run_turn 收尾，停止按钮直接中断等待、允许人工接管。
+            if ctx.rate_limited_suspended && !ctx.turn_active {
+                ctx.rate_limited_suspended = false;
+                ctx.missing_completion_count = 0;
+                ctx.rate_limit_wait_seq = ctx.rate_limit_wait_seq.wrapping_add(1);
+                ctx.rate_limit_retry_at = None;
+                ctx.busy = false;
+                cancelled_suspend = true;
+            }
+        }
+    }
+    if cancelled_suspend {
+        let _ = app.emit(
+            "agent://project-busy",
+            serde_json::json!({ "id": project_id, "busy": false }),
+        );
+        let _ = app.emit(
+            "agent://rate-limit",
+            serde_json::json!({ "project_id": project_id, "suspended": false }),
+        );
+    }
     Ok(())
 }
 
@@ -1218,6 +1636,51 @@ pub async fn set_compact_threshold(
     inner.projects.set_compact_of(&project_id, value);
     save_projects(&inner)?;
     Ok(value)
+}
+
+#[tauri::command]
+pub async fn get_max_sub(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    let inner = state.inner.lock().await;
+    Ok(inner.projects.max_sub_of(&project_id))
+}
+
+#[tauri::command]
+pub async fn set_max_sub(
+    project_id: String,
+    value: u32,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    if value == 0 {
+        return Err("子 agent 并发上限必须大于 0".into());
+    }
+    let mut inner = state.inner.lock().await;
+    inner.projects.set_max_sub_of(&project_id, value);
+    save_projects(&inner)?;
+    Ok(value)
+}
+
+#[tauri::command]
+pub async fn get_warmup(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let inner = state.inner.lock().await;
+    Ok(inner.projects.warmup_of(&project_id))
+}
+
+#[tauri::command]
+pub async fn set_warmup(
+    project_id: String,
+    on: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mut inner = state.inner.lock().await;
+    inner.projects.set_warmup_of(&project_id, on);
+    save_projects(&inner)?;
+    Ok(())
 }
 
 #[tauri::command]

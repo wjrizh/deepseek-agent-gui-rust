@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::prompt_gui::{DSML_ERROR_PROMPT, FORMAT_ERROR_PROMPT, TOOLS_SECTION_GUI, system_prompt_with_env};
-use crate::state::{AppState, BRIDGE_IDLE_SECS};
+use crate::state::{AppState, Inner, BRIDGE_IDLE_SECS};
 use deepseek_agent::agent::model::Model;
 use deepseek_agent::agent::parser::{self, ParseOutcome};
 use deepseek_agent::agent::tool::Tool;
@@ -176,6 +176,82 @@ pub(crate) fn ends_with_tool_prefix(text: &str) -> bool {
 pub(crate) const REPORT_PROMPT: &str = "请对本次对话做一份工作交接报告，用中文输出，包含以下部分：\n1. 任务目标\n2. 已完成的工作与产出\n3. 积累的经验/结论\n4. 尚未解决的问题\n5. 接下来要解决的问题\n只输出报告本身，不要客套。";
 
 pub(crate) const HANDOFF_INTRO: &str = "以下是从上一会话交接过来的工作进度报告。请先确认收到这份报告，然后我们继续。\n\n===== 交接报告开始 =====\n";
+
+/// 完成兜底标记（独占末行）。模型未调用 task_complete 时的兼容信号。
+/// 限流挂起后调度自动重试：每 10 分钟醒来一次，可迭代等待，
+/// 直到某次重试成功、或被人为接管/新 turn 取代（seq/gen 不匹配）时退出。
+///
+/// 迭代方式：唤醒后清除挂起标记并发起新 turn；若该 turn 再次被限流，
+/// 会重新置挂起并自增 `rate_limit_wait_seq`，旧等待任务随之作废，
+/// 由新的等待任务继续下一轮 10 分钟等待。
+pub(crate) fn schedule_rate_limit_retry(
+    app: AppHandle,
+    inner: Arc<Mutex<Inner>>,
+    project_id: String,
+    my_gen: u64,
+    my_seq: u64,
+) {
+    tauri::async_runtime::spawn(async move {
+        const RATE_LIMIT_WAIT: Duration = Duration::from_secs(600);
+        tokio::time::sleep(RATE_LIMIT_WAIT).await;
+        // 校验：仍挂起、generation 与等待代数均未变（未被新 turn / 人工接管作废）。
+        let ok = {
+            let guard = inner.lock().await;
+            guard.running.get(&project_id)
+                .map(|c| {
+                    c.turn_gen == my_gen
+                        && c.rate_limited_suspended
+                        && c.rate_limit_wait_seq == my_seq
+                })
+                .unwrap_or(false)
+        };
+        if !ok {
+            return;
+        }
+        // 清除挂起标记、推进等待代数（本任务让位），再发起新 turn。
+        // 若该 turn 再次被限流，会重新挂起并再次调度，形成 10 分钟级迭代。
+        {
+            let mut guard = inner.lock().await;
+            match guard.running.get_mut(&project_id) {
+                Some(c) if c.turn_gen == my_gen && c.rate_limit_wait_seq == my_seq => {
+                    c.rate_limited_suspended = false;
+                    c.missing_completion_count = 0;
+                    c.rate_limit_wait_seq = c.rate_limit_wait_seq.wrapping_add(1);
+                    c.rate_limit_retry_at = None;
+                }
+                _ => return,
+            }
+        }
+        let _ = app.emit("agent://rate-limit", serde_json::json!({
+            "project_id": project_id, "suspended": false,
+        }));
+        let _ = crate::commands::start_turn(
+            app.clone(),
+            project_id.clone(),
+            "刚才触发了限流，任务已挂起。请继续未完成的任务；若已完成请调用 task_complete。".to_string(),
+        ).await;
+    });
+}
+
+pub(crate) const DONE_MARKER: &str = "__DSA_DONE__";
+/// 连续缺完成信号上限：超过判为限流挂起。
+pub(crate) const MISSING_COMPLETION_MAX: u32 = 3;
+/// 缺完成信号时注入的继续提示。
+pub(crate) const CONTINUE_PROMPT: &str = "你可能已完成任务，也可能输出被截断，也可能受到限流。请检查：若未完成请继续执行；若已完成，请调用 task_complete 并提供一句简短总结，或单独输出一行 __DSA_DONE__。不要重复已完成的工具调用。";
+
+/// 剥离正文末行的完成标记，返回 (正文, 是否含标记)。
+pub(crate) fn strip_done_marker(text: &str) -> (String, bool) {
+    let trimmed = text.trim_end();
+    if let Some(pos) = trimmed.rfind(DONE_MARKER) {
+        let after = trimmed[pos + DONE_MARKER.len()..].trim();
+        if after.is_empty() {
+            let mut body = trimmed[..pos].to_string();
+            body = body.trim_end().to_string();
+            return (body, true);
+        }
+    }
+    (text.to_string(), false)
+}
 
 pub(crate) const SUB_REVIEW_PROMPT: &str = "以下是子 agent 的完成结果。请审阅：若合格，简要说明并继续；若异常（幻觉/不完整/格式错/中断），用同名 sub_agent 重试（最多 3 次）；3 次仍失败则给出可执行的解决方案。";
 
@@ -454,7 +530,9 @@ pub async fn run_turn(
             .map(|p| p.conversations.iter().any(|c| c.id == session_id))
             .unwrap_or(false);
         let mut registered_now = false;
-        if !registered {
+        // 网页内核 new_session() 返回空串：此时不建本地会话（空 id 会变成"对话1"），
+        // 待首轮拿到真实 UUID 后再补建（见下方 session_id.is_empty() 分支）。
+        if !registered && !session_id.is_empty() {
             let title = inner.projects.next_conversation_title(&project_id);
             let _ = inner.projects.add_conversation(&project_id, &session_id, &title);
             let _ = inner.projects.save();
@@ -519,6 +597,15 @@ pub async fn run_turn(
     let ec = EmitCtx::main(&app, &project_id);
 
     let mut format_retries: u32 = 0;
+    let mut missing_completion: u32 = 0;
+    // 模型主动请求压缩：置位后在本轮顶部走压缩分支。
+    let mut force_compact = false;
+    // 上次注入 `[运行状态]` 时的消息数分桶（每 10 条注入一次）。
+    let mut last_status_bucket: i64 = -1;
+    // 上次注入的子 agent 状态文本（内容变化时立即注入）。
+    let mut last_sub_status = String::new();
+    // 子 agent 状态注入的轮数计数：全部空闲时每 10 轮注入一次，有运行中则每轮注入。
+    let mut sub_status_rounds: u32 = 0;
     loop {
         {
             let n = model
@@ -532,7 +619,8 @@ pub async fn run_turn(
                 .await
                 .projects
                 .compact_of(&project_id);
-            if n >= compact_threshold {
+            if n >= compact_threshold || force_compact {
+                force_compact = false;
                 let parent = {
                     state.inner.lock().await
                         .running.get(&project_id)
@@ -554,7 +642,18 @@ pub async fn run_turn(
                     return Ok(());
                 }
                 let new_sid = model.new_session().await.map_err(|e| e.to_string())?;
-                {
+                if new_sid.is_empty() {
+                    // 网页内核无预建会话接口：空 session 不持久化，进入"待绑定"。
+                    // 用空 session 发首轮让网页创建真实会话，拿到真实 UUID 后再补建本地会话。
+                    let mut inner = state.inner.lock().await;
+                    let ctx = inner.running.get_mut(&project_id).ok_or("上下文丢失")?;
+                    ctx.session.session_id = None;
+                    ctx.session.parent_message_id = None;
+                    ctx.session.prompt_sent = false;
+                    ctx.session.pending_handoff = true;
+                    ctx.session.pending_report = Some(report.clone());
+                    session_id = String::new();
+                } else {
                     let mut inner = state.inner.lock().await;
                     let title = inner.projects.next_conversation_title(&project_id);
                     let _ = inner.projects.add_conversation(&project_id, &new_sid, &title);
@@ -563,10 +662,12 @@ pub async fn run_turn(
                     ctx.session.session_id = Some(new_sid.clone());
                     ctx.session.parent_message_id = None;
                     ctx.session.prompt_sent = true;
+                    ctx.session.pending_handoff = false;
+                    ctx.session.pending_report = None;
+                    session_id = new_sid;
                 }
                 let _ = app.emit("agent://projects-changed", ());
                 let _ = app.emit("agent://handoff", serde_json::json!({ "project_id": project_id, "count": n }));
-                session_id = new_sid;
                 next_prompt = format!("{}\n\n{TOOLS_SECTION_GUI}\n\n{HANDOFF_INTRO}{report}\n===== 交接报告结束 =====\n\n{input}", system_prompt_with_env());
             }
         }
@@ -590,13 +691,14 @@ pub async fn run_turn(
             )
         };
 
-        // 每轮都带上当前项目子 agent 状态。
+        // 子 agent 状态注入策略：内容变化立即注入；否则有运行中每轮注入，
+        // 全部空闲时每 10 轮注入一次（避免无意义刷屏）。
         {
-            let sub_status = {
+            let (sub_status, running) = {
                 let inner = state.inner.lock().await;
                 let subs = inner.projects.sub_agents_of(&project_id);
                 if subs.is_empty() {
-                    String::new()
+                    (String::new(), 0usize)
                 } else {
                     let mut parts = Vec::new();
                     let mut running = 0usize;
@@ -612,11 +714,21 @@ pub async fn run_turn(
                         };
                         parts.push(format!("{}（{}）", sa.name, st));
                     }
-                    format!("\n[系统] 本项目子agent：共 {}（运行 {}）—— {}\n", subs.len(), running, parts.join("、"))
+                    (
+                        format!("\n[系统] 本项目子agent：共 {}（运行 {}）—— {}\n", subs.len(), running, parts.join("、")),
+                        running,
+                    )
                 }
             };
+            sub_status_rounds = sub_status_rounds.wrapping_add(1);
             if !sub_status.is_empty() {
-                next_prompt.push_str(&sub_status);
+                let changed = sub_status != last_sub_status;
+                let due = running > 0 || sub_status_rounds >= 10;
+                if changed || due {
+                    next_prompt.push_str(&sub_status);
+                    last_sub_status = sub_status;
+                    sub_status_rounds = 0;
+                }
             }
         }
 
@@ -713,23 +825,38 @@ pub async fn run_turn(
 
         if let Some(real_sid) = &reply.session_id {
             if !real_sid.is_empty() && real_sid != &session_id {
-                let _ = crate::projects::rename_conversation_file(&session_id, real_sid);
                 let mut inner = state.inner.lock().await;
-                if let Some(p) = inner.projects.project_mut(&project_id) {
-                    if let Some(c) = p.conversations.iter_mut().find(|c| c.id == session_id) {
-                        c.id = real_sid.clone();
-                    }
-                }
-                if let Some(ctx) = inner.running.get_mut(&project_id) {
-                    if ctx.session.session_id.as_deref() == Some(session_id.as_str()) {
+                if session_id.is_empty() {
+                    // 压缩交接后首次拿到真实 UUID：此时才补建本地会话（避免持久化空 session）。
+                    let title = inner.projects.next_conversation_title(&project_id);
+                    let _ = inner.projects.add_conversation(&project_id, real_sid, &title);
+                    if let Some(ctx) = inner.running.get_mut(&project_id) {
                         ctx.session.session_id = Some(real_sid.clone());
+                        ctx.session.pending_handoff = false;
+                        ctx.session.pending_report = None;
                     }
+                    inner.projects.set_active_conversation_of(&project_id, Some(real_sid.as_str()));
+                    let _ = inner.projects.save();
+                    session_id = real_sid.clone();
+                    let _ = app.emit("agent://projects-changed", ());
+                } else {
+                    let _ = crate::projects::rename_conversation_file(&session_id, real_sid);
+                    if let Some(p) = inner.projects.project_mut(&project_id) {
+                        if let Some(c) = p.conversations.iter_mut().find(|c| c.id == session_id) {
+                            c.id = real_sid.clone();
+                        }
+                    }
+                    if let Some(ctx) = inner.running.get_mut(&project_id) {
+                        if ctx.session.session_id.as_deref() == Some(session_id.as_str()) {
+                            ctx.session.session_id = Some(real_sid.clone());
+                        }
+                    }
+                    // 同步 active_by_project，确保重启后 open_project 能取到真实 UUID
+                    inner.projects.set_active_conversation_of(&project_id, Some(real_sid.as_str()));
+                    let _ = inner.projects.save();
+                    session_id = real_sid.clone();
+                    let _ = app.emit("agent://projects-changed", ());
                 }
-                // 同步 active_by_project，确保重启后 open_project 能取到真实 UUID
-                inner.projects.set_active_conversation_of(&project_id, Some(real_sid.as_str()));
-                let _ = inner.projects.save();
-                session_id = real_sid.clone();
-                let _ = app.emit("agent://projects-changed", ());
             }
         }
         if reply.message_id.is_some() {
@@ -761,14 +888,111 @@ pub async fn run_turn(
                         );
                     }
                 }
-                let cleaned = text.trim().to_string();
+                let (body, has_done) = strip_done_marker(&text);
+                let cleaned = body.trim().to_string();
                 if !cleaned.is_empty() {
                     let _ = crate::projects::append_message(&session_id, "assistant", &cleaned);
                 }
                 refresh_message_count(&app, state, &model, &project_id, &session_id).await;
-                return Ok(());
+                if has_done {
+                    return Ok(());
+                }
+                // 存在子 agent（运行中，或结果已到待回注）时，主 agent 的纯文本
+                // 属合法暂停，不判为"缺完成信号"（避免等子 agent 时被误判限流）。
+                // 子 agent 完成后经 inject_sub_result / 收尾 pending 唤起审阅 turn。
+                let has_pending_or_running_sub = {
+                    let inner = state.inner.lock().await;
+                    let running = inner.sub_runs.values().any(|r| {
+                        r.project_id == project_id
+                            && matches!(
+                                r.status,
+                                crate::state::SubRunStatus::Running
+                                    | crate::state::SubRunStatus::Starting
+                            )
+                    });
+                    let pending = inner
+                        .pending_sub_results
+                        .get(&project_id)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false);
+                    running || pending
+                };
+                if has_pending_or_running_sub {
+                    return Ok(());
+                }
+                // 无完成信号：可能是截断/限流；累计连续缺失，超过上限则挂起。
+                missing_completion += 1;
+                {
+                    let mut inner = state.inner.lock().await;
+                    if let Some(ctx) = inner.running.get_mut(&project_id) {
+                        ctx.missing_completion_count = missing_completion;
+                    }
+                }
+                if missing_completion > MISSING_COMPLETION_MAX {
+                    let retry_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0)
+                        + 600;
+                    let (my_gen, my_seq) = {
+                        let mut inner = state.inner.lock().await;
+                        match inner.running.get_mut(&project_id) {
+                            Some(ctx) => {
+                                ctx.rate_limited_suspended = true;
+                                ctx.rate_limit_wait_seq = ctx.rate_limit_wait_seq.wrapping_add(1);
+                                ctx.rate_limit_retry_at = Some(retry_at);
+                                (ctx.turn_gen, ctx.rate_limit_wait_seq)
+                            }
+                            None => (0, 0),
+                        }
+                    };
+                    let _ = app.emit("agent://rate-limit", serde_json::json!({
+                        "project_id": project_id,
+                        "suspended": true,
+                        "next_retry_at": retry_at,
+                    }));
+                    let account = {
+                        let inner = state.inner.lock().await;
+                        inner.projects.project(&project_id).map(|p| p.account.clone()).unwrap_or_default()
+                    };
+                    let _ = app.emit("agent://error", crate::commands::error_payload(
+                        &project_id,
+                        "连续多次未收到完成信号，判定为限流，任务已挂起，将在 10 分钟后自动重试",
+                        Some(&account), None,
+                    ));
+                    schedule_rate_limit_retry(app.clone(), state.inner.clone(), project_id.clone(), my_gen, my_seq);
+                    return Ok(());
+                }
+                let mut np = CONTINUE_PROMPT.to_string();
+                {
+                    let used = model.message_count(&session_id).await.unwrap_or(None).unwrap_or(0);
+                    let bucket = used / 10;
+                    if bucket != last_status_bucket {
+                        last_status_bucket = bucket;
+                        np.push('\n');
+                        np.push_str(&status_block(state, &project_id, &model, &session_id).await);
+                    }
+                }
+                next_prompt = np;
+                continue;
             }
             ParseOutcome::Calls(calls) => {
+                // 出现合法工具调用 = 格式恢复正常，重置"连续格式错误"计数。
+                format_retries = 0;
+                // 分离完成信号与普通工具：有普通工具时先执行工具、忽略本轮的完成信号。
+                let (done_calls, rest): (Vec<_>, Vec<_>) =
+                    calls.into_iter().partition(|c| c.name == "task_complete");
+                let (compact_calls, rest): (Vec<_>, Vec<_>) =
+                    rest.into_iter().partition(|c| c.name == "request_context_compaction");
+                let (ask_calls, tool_calls): (Vec<_>, Vec<_>) =
+                    rest.into_iter().partition(|c| c.name == "ask_user");
+                let want_complete = !done_calls.is_empty() && tool_calls.is_empty()
+                    && compact_calls.is_empty() && ask_calls.is_empty()
+                    && done_calls.iter().any(|c| !c.params.get("summary").map(|x| x.trim().is_empty()).unwrap_or(true));
+                // 主动压缩：独占本轮时触发；防滥用——本会话至少 10 条消息，否则忽略。
+                let want_compact = !compact_calls.is_empty() && tool_calls.is_empty() && done_calls.is_empty() && ask_calls.is_empty();
+                let want_ask = !ask_calls.is_empty() && tool_calls.is_empty() && done_calls.is_empty() && compact_calls.is_empty();
+                let calls = tool_calls;
                 // 含工具调用的回复：只反馈工具状态，不打印伴随的正文。
                 // 丢弃 gate 中缓冲的文本（工具标记之前的说明文字）。
                 answer_gate.lock().unwrap().finish_text();
@@ -831,13 +1055,74 @@ pub async fn run_turn(
                 };
                 let has_pending = !drained.is_empty();
                 for r in drained {
-                    results.push_str(&format!(
-                        "\n<sub_agent_result name=\"{}\" ok=\"{}\">\n{}\n</sub_agent_result>\n",
-                        r.name, r.ok, r.text
-                    ));
+                    results.push_str(&crate::subagent::format_sub_result(&r.name, r.ok, &r.text));
                 }
                 if has_pending {
                     results.push_str(&format!("\n{}\n", SUB_REVIEW_PROMPT));
+                }
+                if want_ask {
+                    let question = ask_calls.iter()
+                        .filter_map(|c| c.params.get("question"))
+                        .map(|s| s.trim().to_string())
+                        .find(|s| !s.is_empty())
+                        .unwrap_or_default();
+                    if !question.is_empty() {
+                        let _ = crate::projects::append_message(&session_id, "assistant", &question);
+                        let _ = app.emit("agent://ask", serde_json::json!({
+                            "project_id": project_id,
+                            "question": question,
+                        }));
+                    }
+                    return Ok(());
+                }
+                if want_complete {
+                    let summary = done_calls.iter()
+                        .filter_map(|c| c.params.get("summary"))
+                        .map(|s| s.trim().to_string())
+                        .find(|s| !s.is_empty())
+                        .unwrap_or_default();
+                    if !summary.is_empty() {
+                        let _ = app.emit("agent://delta", serde_json::json!({
+                            "project_id": project_id, "kind": "answer", "text": summary
+                        }));
+                        let _ = crate::projects::append_message(&session_id, "assistant", &summary);
+                    }
+                    let mut inner = state.inner.lock().await;
+                    if let Some(ctx) = inner.running.get_mut(&project_id) {
+                        ctx.missing_completion_count = 0;
+                    }
+                    return Ok(());
+                }
+                missing_completion = 0;
+                {
+                    let mut inner = state.inner.lock().await;
+                    if let Some(ctx) = inner.running.get_mut(&project_id) {
+                        ctx.missing_completion_count = 0;
+                    }
+                }
+                if want_compact {
+                    // 防滥用：本会话消息数过少（<10）时忽略请求，避免频繁重建会话。
+                    let n = model.message_count(&session_id).await
+                        .unwrap_or(None).unwrap_or(0);
+                    if n < 10 {
+                        let _ = app.emit("agent://delta", serde_json::json!({
+                            "project_id": project_id, "kind": "answer",
+                            "text": "\n[系统] 忽略本次上下文压缩请求：当前会话消息过少，无需压缩。"
+                        }));
+                        next_prompt = results;
+                        continue;
+                    }
+                    force_compact = true;
+                    continue;
+                }
+                {
+                    let used = model.message_count(&session_id).await.unwrap_or(None).unwrap_or(0);
+                    let bucket = used / 10;
+                    if bucket != last_status_bucket {
+                        last_status_bucket = bucket;
+                        results.push('\n');
+                        results.push_str(&status_block(state, &project_id, &model, &session_id).await);
+                    }
                 }
                 next_prompt = results;
                 continue;
@@ -850,10 +1135,13 @@ pub async fn run_turn(
                 );
                 format_retries += 1;
                 if format_retries > 3 {
-                    let _ = app.emit("agent://error", serde_json::json!({
-                        "project_id": project_id,
-                        "message": "模型连续多次输出格式错误，已停止本轮",
-                    }));
+                    let account = {
+                        let inner = state.inner.lock().await;
+                        inner.projects.project(&project_id).map(|p| p.account.clone()).unwrap_or_default()
+                    };
+                    let _ = app.emit("agent://error", crate::commands::error_payload(
+                        &project_id, "模型连续多次输出格式错误，已停止本轮", Some(&account), None,
+                    ));
                     return Ok(());
                 }
                 next_prompt = format!("{FORMAT_ERROR_PROMPT}\n\n（解析失败原因：{reason}）");
@@ -871,10 +1159,13 @@ pub async fn run_turn(
                 );
                 format_retries += 1;
                 if format_retries > 3 {
-                    let _ = app.emit("agent://error", serde_json::json!({
-                        "project_id": project_id,
-                        "message": "模型连续多次输出格式错误，已停止本轮",
-                    }));
+                    let account = {
+                        let inner = state.inner.lock().await;
+                        inner.projects.project(&project_id).map(|p| p.account.clone()).unwrap_or_default()
+                    };
+                    let _ = app.emit("agent://error", crate::commands::error_payload(
+                        &project_id, "模型连续多次输出格式错误，已停止本轮", Some(&account), None,
+                    ));
                     return Ok(());
                 }
                 next_prompt = format!(
@@ -884,6 +1175,25 @@ pub async fn run_turn(
             }
         }
     }
+}
+
+/// 上下文状态块：当前消息数 + 压缩阈值，供模型自我判断是否需精简/压缩。
+pub(crate) async fn status_block(
+    state: &AppState,
+    project_id: &str,
+    model: &Arc<dyn Model>,
+    session_id: &str,
+) -> String {
+    let threshold = state.inner.lock().await.projects.compact_of(project_id);
+    let used = model
+        .message_count(session_id)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(0);
+    format!(
+        "[运行状态] 当前上下文消息数 {used}（压缩阈值 {threshold}）。\
+        若接近阈值请精简输出，必要时调用 request_context_compaction。\n"
+    )
 }
 
 pub(crate) async fn refresh_message_count(
@@ -1139,12 +1449,13 @@ async fn run_sub_agent_tool(
 
             {
                 let inner = state.inner.lock().await;
+                let limit = inner.projects.max_sub_of(&project_id) as usize;
                 let running = inner.sub_runs.values()
                     .filter(|r| r.project_id == project_id
                         && matches!(r.status, crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting))
                     .count();
-                if running >= 3 {
-                    return Ok("[子agent] 当前已有 3 个子 agent 在运行（一主三子限制），请稍后再派。".into());
+                if running >= limit {
+                    return Ok(format!("[子agent] 当前已有 {limit} 个子 agent 在运行（并发上限），请稍后再派。").into());
                 }
             }
 

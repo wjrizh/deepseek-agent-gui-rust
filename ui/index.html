@@ -64,6 +64,15 @@
           <span class="compact-text">压缩阈值</span>
           <input id="compact-input" class="compact-input" type="number" min="1" step="1" placeholder="300" />
         </label>
+        <label id="maxsub-label" class="compact-label" title="该项目子 agent 并发上限">
+          <span class="compact-text">子agent上限</span>
+          <input id="maxsub-input" class="compact-input" type="number" min="1" step="1" placeholder="3" />
+        </label>
+        <label id="warmup-toggle" class="restrict-toggle" title="打开项目时预启动浏览器（减少首字延迟，默认关）">
+          <input type="checkbox" id="warmup-check" />
+          <span class="restrict-track"><span class="restrict-knob"></span></span>
+          <span class="restrict-label">预热</span>
+        </label>
         <button id="ide-btn" class="ide-btn" title="打开该项目的 IDE 窗口">IDE</button>
       </div>
 

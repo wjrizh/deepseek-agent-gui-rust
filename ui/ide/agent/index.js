@@ -14,6 +14,7 @@ let sendBtn = null;
 let stopBtn = null;
 let uninstallEvents = null;
 let onBusyCb = null;
+let statusTimer = null;
 
 function ensureBuilt() {
   if (rootEl) return;
@@ -23,13 +24,50 @@ function ensureBuilt() {
   stopBtn = document.getElementById("agent-stop");
 }
 
+function renderStatusBar() {
+  const bar = document.getElementById("agent-status");
+  if (!bar || !store) return;
+  const c = store.subCountText();
+  const subText = c.total ? "子agent " + c.running + "/" + c.total : "";
+  if (store.rateLimited) {
+    let tip = "限流挂起，等待自动重试";
+    if (store.nextRetryAt) {
+      const left = Math.max(0, store.nextRetryAt - Math.floor(Date.now() / 1000));
+      const m = Math.floor(left / 60), s = left % 60;
+      tip += "（" + m + ":" + String(s).padStart(2, "0") + " 后重试；点停止可接管）";
+    }
+    bar.textContent = tip + (subText ? " · " + subText : "");
+  } else {
+    bar.textContent = subText;
+  }
+}
+
+const subHandlers = {
+  stop(s) {
+    invoke("stop_sub_agent", { projectId: store.projectId, subId: s.id })
+      .catch((e) => store.error(String(e)));
+  },
+  retry(s) {
+    invoke("retry_sub_agent", { projectId: store.projectId, subId: s.id })
+      .catch((e) => store.error(String(e)));
+  },
+  cont(s) {
+    const task = window.prompt("继续该子 agent 的新任务内容：");
+    if (!task || !task.trim()) return;
+    invoke("continue_sub_agent", { projectId: store.projectId, subId: s.id, task })
+      .catch((e) => store.error(String(e)));
+  },
+  retryNew(s) {
+    invoke("retry_sub_agent_new_conv", { projectId: store.projectId, subId: s.id })
+      .catch((e) => store.error(String(e)));
+  },
+};
+
 function rerender() {
   if (!rootEl || !store) return;
-  render(rootEl, store);
+  render(rootEl, store, subHandlers);
   updateControls(store, { sendBtn, stopBtn, input: inputEl });
-  const c = store.subCountText();
-  const bar = document.getElementById("agent-status");
-  if (bar) bar.textContent = c.total ? "子agent " + c.running + "/" + c.total : "";
+  renderStatusBar();
 }
 
 function doSend() {
@@ -46,11 +84,22 @@ function doSend() {
 export function initAgent({ projectId, onBusy }) {
   ensureBuilt();
   if (!rootEl) return;
-  if (store) return; // 已初始化，避免重复绑定
+  // 项目切换：卸载旧监听 + 重建 store（避免旧项目事件污染）。
+  if (store && store.projectId !== projectId) {
+    if (uninstallEvents) { uninstallEvents(); uninstallEvents = null; }
+    store = null;
+  }
+  if (store) return; // 同项目已初始化，避免重复绑定
   store = createStore(projectId);
   store.subscribe(rerender);
   uninstallEvents = installAgentEvents(store, onBusy);
   onBusyCb = onBusy;
+  // 每秒刷新限流倒计时（仅在挂起时变化）。
+  if (!statusTimer) {
+    statusTimer = setInterval(() => {
+      if (store && store.rateLimited) renderStatusBar();
+    }, 1000);
+  }
 
   sendBtn?.addEventListener("click", doSend);
   stopBtn?.addEventListener("click", () => {
@@ -63,6 +112,7 @@ export function initAgent({ projectId, onBusy }) {
 
 export function disposeAgent() {
   if (uninstallEvents) { uninstallEvents(); uninstallEvents = null; }
+  if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
   store = null; rootEl = null; inputEl = null; sendBtn = null; stopBtn = null;
 }
 

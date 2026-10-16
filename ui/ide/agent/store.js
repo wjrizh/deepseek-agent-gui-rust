@@ -11,6 +11,8 @@ export function createStore(projectId) {
     toolByCallId: new Map(),
     subAgents: new Map(),
     subToolById: new Map(),
+    rateLimited: false,    // 限流挂起等待自动重试
+    nextRetryAt: null,     // 下次重试时间（Unix 秒）
     listeners: new Set(),
 
     subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); },
@@ -96,11 +98,13 @@ export function createStore(projectId) {
       this.emitChange();
     },
 
-    subStart(id, name, duty) {
+    subStart(id, name, duty, gen) {
       if (!id) return;
       let s = this.subAgents.get(id);
-      if (!s) { s = { id, name: name || id, duty: duty || "", status: "running", ok: null, reason: null, text: "", lines: [], tools: [] }; this.subAgents.set(id, s); }
-      s.name = name || s.name; s.duty = duty || s.duty; s.status = "running";
+      const g = (typeof gen === "number") ? gen : 0;
+      if (s && typeof s.gen === "number" && g <s.gen) return; // 旧实例迟到事件
+      if (!s) { s = { id, name: name || id, duty: duty || "", status: "running", ok: null, reason: null, text: "", lines: [], tools: [], gen: g }; this.subAgents.set(id, s); }
+      s.name = name || s.name; s.duty = duty || s.duty; s.status = "running"; s.gen = g;
       this.emitChange();
     },
     subDelta(id, name, text) {
@@ -128,17 +132,39 @@ export function createStore(projectId) {
       }
       this.emitChange();
     },
-    subDone(id, name, ok, reason, result) {
+    subDone(id, name, ok, reason, result, gen) {
       if (!id) return;
       let s = this.subAgents.get(id);
-      if (!s) { s = { id, name: name || id, duty: "", status: "done", ok: null, reason: null, text: "", lines: [], tools: [] }; this.subAgents.set(id, s); }
-      s.status = ok ? "done" : "failed";
-      s.ok = !!ok; s.reason = reason || null; s.text = result || "";
+      const g = (typeof gen === "number") ? gen : 0;
+      if (s && typeof s.gen === "number" && g <s.gen) return; // 旧实例迟到事件
+      if (!s) { s = { id, name: name || id, duty: "", status: "done", ok: null, reason: null, text: "", lines: [], tools: [], gen: g }; this.subAgents.set(id, s); }
+      s.status = ok ? "done" : (reason === "cancelled" ? "cancelled" : "failed");
+      s.ok = !!ok; s.reason = reason || null; s.text = result || ""; s.gen = g;
       this.emitChange();
     },
-    subClose(id, name) {
+    subClose(id, name, gen) {
       const s = id ? this.subAgents.get(id) : [...this.subAgents.values()].find((x) => x.name === name);
-      if (s) { s.status = "closed"; this.emitChange(); }
+      if (!s) return;
+      if (typeof gen === "number" && typeof s.gen === "number" && gen < s.gen) return; // 旧实例迟到事件
+      s.status = "closed"; this.emitChange();
+    },
+    // 从后端运行态快照播种状态（与 sub-* 事件同一状态集）。
+    subSync(runs) {
+      if (!Array.isArray(runs)) return;
+      for (const r of runs) {
+        if (!r || !r.sub_id || r.status === "closed") continue;
+        const cur = this.subAgents.get(r.sub_id);
+        const g = (typeof r.run_generation === "number") ? r.run_generation : 0;
+        if (cur && typeof cur.gen === "number" && g < cur.gen) continue;
+        const status = r.status === "succeeded" ? "done"
+          : r.status === "failed" ? "failed"
+          : r.status === "cancelled" ? "cancelled"
+          : "running";
+        const s = cur || { id: r.sub_id, name: r.name || r.sub_id, duty: r.duty || "", ok: null, reason: null, text: "", lines: [], tools: [] };
+        s.name = r.name || s.name; s.duty = r.duty || s.duty; s.status = status; s.gen = g;
+        this.subAgents.set(r.sub_id, s);
+      }
+      this.emitChange();
     },
     subCountText() {
       let total = 0, running = 0;
@@ -148,6 +174,13 @@ export function createStore(projectId) {
 
     setRunning(on) {
       this.running = !!on;
+      this.emitChange();
+    },
+
+    // 限流挂起态：suspended=true 时记录下次重试时间，供倒计时。
+    setRateLimit(suspended, nextRetryAt) {
+      this.rateLimited = !!suspended;
+      this.nextRetryAt = suspended ? (nextRetryAt || null) : null;
       this.emitChange();
     },
   };
