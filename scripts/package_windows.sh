@@ -39,8 +39,13 @@ cp -r "$PW_SRC/playwright" "$PW_SRC/playwright-core" "$RT/node_modules/"
 if [ -d "$PW_SRC/@playwright" ]; then cp -r "$PW_SRC/@playwright" "$RT/node_modules/"; fi
 
 echo "==> chromium $PW_REV ($PW_CHR_VER)"
+# cdn.playwright.dev 在部分网络不可达；优先 npmmirror 镜像，失败回退官方源。
+CFT_MIRROR="https://cdn.npmmirror.com/binaries/playwright/builds/cft/${PW_CHR_VER}/win64/chrome-win64.zip"
 CFT_URL="https://cdn.playwright.dev/builds/cft/${PW_CHR_VER}/win64/chrome-win64.zip"
-curl -fSL --retry 3 -o "$TMP/chrome.zip" "$CFT_URL"
+if ! curl -fSL --retry 2 --connect-timeout 10 -o "$TMP/chrome.zip" "$CFT_MIRROR"; then
+  echo "   mirror 失败，回退官方源"
+  curl -fSL --retry 3 -o "$TMP/chrome.zip" "$CFT_URL"
+fi
 CH="$RT/browsers/chromium-$PW_REV"
 mkdir -p "$CH"
 unzip -o -q "$TMP/chrome.zip" -d "$CH"
@@ -52,17 +57,25 @@ cp "$ROOT/vendor/deepseek-agent/bridge/bridge_server.mjs" "$ROOT/vendor/deepseek
 sed -i "s/const HEADLESS = process.env.LIGONG_HEADLESS === '1';/const HEADLESS = process.env.LIGONG_HEADLESS !== '0';/" "$RT/bridge/bridge_server.mjs"
 grep -q "LIGONG_HEADLESS !== '0'" "$RT/bridge/bridge_server.mjs" || { echo "!! bridge 无头替换失败" >&2; exit 1; }
 
-echo "==> seed accounts"
-for acc in Y HJ; do
-  if [ -d "$HOME/.deepseek-agent/accounts/$acc" ]; then
-    mkdir -p "$STAGE/seed/accounts/$acc"
-    cp -r "$HOME/.deepseek-agent/accounts/$acc/." "$STAGE/seed/accounts/$acc/" 2>/dev/null || true
-  fi
-  if [ -f "$HOME/.ligong/accounts/$acc/state.json" ]; then
+echo "==> seed accounts (all)"
+SRC_HOME="${SRC_HOME:-$HOME}"
+if [ -d "$SRC_HOME/.ligong/accounts" ]; then
+  for d in "$SRC_HOME"/.ligong/accounts/*/; do
+    [ -d "$d" ] || continue
+    acc="$(basename "$d")"
     mkdir -p "$STAGE/seed/ligong-accounts/$acc"
-    cp "$HOME/.ligong/accounts/$acc/state.json" "$STAGE/seed/ligong-accounts/$acc/state.json"
-  fi
-done
+    cp "$d/state.json" "$STAGE/seed/ligong-accounts/$acc/state.json" 2>/dev/null || true
+  done
+fi
+if [ -d "$SRC_HOME/.deepseek-agent/accounts" ]; then
+  for d in "$SRC_HOME"/.deepseek-agent/accounts/*/; do
+    [ -d "$d" ] || continue
+    acc="$(basename "$d")"
+    mkdir -p "$STAGE/seed/accounts/$acc"
+    cp -r "$d." "$STAGE/seed/accounts/$acc/" 2>/dev/null || true
+  done
+fi
+echo "   seeded: $(ls "$STAGE/seed/ligong-accounts" 2>/dev/null | tr '\n' ' ')"
 
 echo "==> zip"
 ZIP="$OUT/${PKG}-${VER}-win-x64.zip"

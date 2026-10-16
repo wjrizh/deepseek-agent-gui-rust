@@ -55,13 +55,26 @@ fi
 echo "==> bridge"
 cp "$ROOT/vendor/deepseek-agent/bridge/bridge_server.mjs" "$ROOT/vendor/deepseek-agent/bridge/browser_login.mjs" "$ROOTDIR/runtime/bridge/"
 
-# 不再随包分发任何账户 cookie/登录态（防止他人登录我们的账号）。
-# 用户首次运行需自行登录。
+# 打包登录态：cookie(state.json) + 持久化浏览器 profile。
+# 产物运行时会用 run.sh 将 HOME 指向 $ROOTDIR/data，故按 ~/.ligong 与 ~/.deepseek-agent 结构放置。
+echo "==> login state (cookies + profiles)"
+DATADIR="$ROOTDIR/data"
+mkdir -p "$DATADIR/.ligong/accounts" "$DATADIR/.deepseek-agent/accounts"
+SRC_HOME="${SRC_HOME:-$HOME}"
+if [ -d "$SRC_HOME/.ligong/accounts" ]; then
+  cp -r "$SRC_HOME/.ligong/accounts/." "$DATADIR/.ligong/accounts/"
+fi
+if [ -d "$SRC_HOME/.deepseek-agent/accounts" ]; then
+  cp -r "$SRC_HOME/.deepseek-agent/accounts/." "$DATADIR/.deepseek-agent/accounts/"
+fi
+echo "   accounts: $(ls "$DATADIR/.ligong/accounts" 2>/dev/null | tr '\n' ' ')"
 
 echo "==> run.sh"
 cat > "$ROOTDIR/run.sh" <<'RUNEOF'
 #!/usr/bin/env bash
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 登录态与浏览器 profile 随包分发，指向产物内 data 目录（应用按 $HOME 读取）。
+export HOME="$DIR/data"
 export LIGONG_RUNTIME="$DIR/runtime"
 export LIGONG_NODE="$DIR/runtime/node"
 export LIGONG_PLAYWRIGHT="$DIR/runtime/node_modules/playwright"

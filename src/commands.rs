@@ -488,19 +488,11 @@ pub async fn get_project_runtime(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let inner = state.inner.lock().await;
-    let (busy, turn_active, turn_gen, suspended, retry_at) = inner
+    let (busy, turn_active, turn_gen) = inner
         .running
         .get(&project_id)
-        .map(|c| {
-            (
-                c.busy,
-                c.turn_active,
-                c.turn_gen,
-                c.rate_limited_suspended,
-                c.rate_limit_retry_at,
-            )
-        })
-        .unwrap_or((false, false, 0, false, None));
+        .map(|c| (c.busy, c.turn_active, c.turn_gen))
+        .unwrap_or((false, false, 0));
     let pending = inner
         .pending_sub_results
         .get(&project_id)
@@ -512,8 +504,6 @@ pub async fn get_project_runtime(
         "busy": busy,
         "turn_active": turn_active,
         "turn_gen": turn_gen,
-        "rate_limited_suspended": suspended,
-        "next_retry_at": retry_at,
         "pending_sub_results": pending,
         "sub_runs": sub_runs,
     }))
@@ -846,7 +836,6 @@ async fn dispatch_sub_agent(
                         r.status,
                         crate::state::SubRunStatus::Running | crate::state::SubRunStatus::Starting
                     )
-                    && !r.rate_limited_suspended
             })
             .count();
         if running >= limit {
@@ -1130,14 +1119,6 @@ pub async fn start_turn(
         if ctx.turn_active {
             return Err("该项目正在处理中".into());
         }
-        // 人工接管：若此前因限流挂起等待自动重试，本次用户输入直接接管，
-        // 清除挂起并作废等待任务（seq 自增）。
-        if ctx.rate_limited_suspended {
-            ctx.rate_limited_suspended = false;
-            ctx.missing_completion_count = 0;
-            ctx.rate_limit_wait_seq = ctx.rate_limit_wait_seq.wrapping_add(1);
-            ctx.rate_limit_retry_at = None;
-        }
         ctx.busy = true;
         ctx.turn_active = true;
         ctx.turn_gen = ctx.turn_gen.wrapping_add(1);
@@ -1180,8 +1161,7 @@ pub async fn start_turn(
                     was_cancelled = ctx.cancel_requested;
                     ctx.cancel = None;
                     ctx.turn_active = false;
-                    // 限流挂起等待重试期间，仍视为"进行中"，保持停止按钮可用。
-                    ctx.busy = has_running_sub || ctx.rate_limited_suspended;
+                    ctx.busy = has_running_sub;
                     ctx.cancel_requested = false;
                 }
             }
@@ -1250,7 +1230,7 @@ pub async fn start_turn(
 }
 
 #[tauri::command]
-pub async fn interrupt(project_id: String, state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+pub async fn interrupt(project_id: String, state: State<'_, AppState>, _app: AppHandle) -> Result<(), String> {
     let (cancel, model) = {
         let inner = state.inner.lock().await;
         match inner.running.get(&project_id) {
@@ -1279,33 +1259,13 @@ pub async fn interrupt(project_id: String, state: State<'_, AppState>, app: AppH
     }
     // 标记用户已请求取消：收尾时据此丢弃 pending、不再自动唤起审阅 turn。
     // 仍不在此处修改 turn_active / cancel，由 run_turn 收尾回调（校验 generation）统一清理。
-    let mut cancelled_suspend = false;
     {
         let mut inner = state.inner.lock().await;
         if let Some(ctx) = inner.running.get_mut(&project_id) {
             if ctx.turn_active {
                 ctx.cancel_requested = true;
             }
-            // 限流挂起等待中：无活跃 run_turn 收尾，停止按钮直接中断等待、允许人工接管。
-            if ctx.rate_limited_suspended && !ctx.turn_active {
-                ctx.rate_limited_suspended = false;
-                ctx.missing_completion_count = 0;
-                ctx.rate_limit_wait_seq = ctx.rate_limit_wait_seq.wrapping_add(1);
-                ctx.rate_limit_retry_at = None;
-                ctx.busy = false;
-                cancelled_suspend = true;
-            }
         }
-    }
-    if cancelled_suspend {
-        let _ = app.emit(
-            "agent://project-busy",
-            serde_json::json!({ "id": project_id, "busy": false }),
-        );
-        let _ = app.emit(
-            "agent://rate-limit",
-            serde_json::json!({ "project_id": project_id, "suspended": false }),
-        );
     }
     Ok(())
 }
@@ -1376,11 +1336,10 @@ pub async fn set_mode(
 #[tauri::command]
 pub async fn get_thinking(project_id: String, state: State<'_, AppState>) -> Result<bool, String> {
     let inner = state.inner.lock().await;
-    Ok(inner
-        .running
-        .get(&project_id)
-        .map(|c| c.session.thinking)
-        .unwrap_or(false))
+    if let Some(ctx) = inner.running.get(&project_id) {
+        return Ok(ctx.session.thinking);
+    }
+    Ok(inner.projects.thinking_of(&project_id))
 }
 
 #[tauri::command]
@@ -1389,30 +1348,34 @@ pub async fn set_thinking(
     on: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (model, thinking, search) = {
+    let maybe = {
         let mut inner = state.inner.lock().await;
-        let ctx = match inner.running.get_mut(&project_id) {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-        ctx.session.thinking = on;
-        (ctx.model.clone(), ctx.session.thinking, ctx.session.search)
+        inner.projects.set_thinking_of(&project_id, on);
+        save_projects(&inner)?;
+        match inner.running.get_mut(&project_id) {
+            Some(c) => {
+                c.session.thinking = on;
+                Some((c.model.clone(), c.session.thinking, c.session.search))
+            }
+            None => None,
+        }
     };
-    model
-        .set_toggles(thinking, search)
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Some((model, thinking, search)) = maybe {
+        model
+            .set_toggles(thinking, search)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn get_search(project_id: String, state: State<'_, AppState>) -> Result<bool, String> {
     let inner = state.inner.lock().await;
-    Ok(inner
-        .running
-        .get(&project_id)
-        .map(|c| c.session.search)
-        .unwrap_or(false))
+    if let Some(ctx) = inner.running.get(&project_id) {
+        return Ok(ctx.session.search);
+    }
+    Ok(inner.projects.search_of(&project_id))
 }
 
 #[tauri::command]
@@ -1421,19 +1384,24 @@ pub async fn set_search(
     on: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (model, thinking, search) = {
+    let maybe = {
         let mut inner = state.inner.lock().await;
-        let ctx = match inner.running.get_mut(&project_id) {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-        ctx.session.search = on;
-        (ctx.model.clone(), ctx.session.thinking, ctx.session.search)
+        inner.projects.set_search_of(&project_id, on);
+        save_projects(&inner)?;
+        match inner.running.get_mut(&project_id) {
+            Some(c) => {
+                c.session.search = on;
+                Some((c.model.clone(), c.session.thinking, c.session.search))
+            }
+            None => None,
+        }
     };
-    model
-        .set_toggles(thinking, search)
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Some((model, thinking, search)) = maybe {
+        model
+            .set_toggles(thinking, search)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

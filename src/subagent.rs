@@ -245,24 +245,17 @@ pub async fn agent_loop(ctx: SubLoopCtx) -> LoopOutcome {
                         ec.delta("answer", &t);
                     }
                 }
-                // 子 agent 无"完成信号"约定：只要没有工具调用即视为完成，
-                // 直接返回文本给主 agent（strip_done_marker 仅作兼容清理）。
-                let (body, _) = crate::runner::strip_done_marker(&text);
-                let cleaned = body.trim().to_string();
+                // 子 agent：只要没有工具调用即视为完成，直接返回文本给主 agent。
+                let cleaned = text.trim().to_string();
                 let ok = !cleaned.is_empty();
                 return LoopOutcome { text: cleaned, ok, reason: if ok { None } else { Some("empty".into()) } };
             }
             ParseOutcome::Calls(calls) => {
                 // 出现合法工具调用 = 格式恢复正常，重置"连续格式错误"计数。
                 format_attempts = 0;
-                let (done_calls, rest): (Vec<_>, Vec<_>) =
-                    calls.into_iter().partition(|c| c.name == "task_complete");
                 let (compact_calls, tool_calls): (Vec<_>, Vec<_>) =
-                    rest.into_iter().partition(|c| c.name == "request_context_compaction");
-                let want_complete = !done_calls.is_empty() && tool_calls.is_empty()
-                    && compact_calls.is_empty()
-                    && done_calls.iter().any(|c| !c.params.get("summary").map(|x| x.trim().is_empty()).unwrap_or(true));
-                let want_compact = !compact_calls.is_empty() && tool_calls.is_empty() && done_calls.is_empty();
+                    calls.into_iter().partition(|c| c.name == "request_context_compaction");
+                let want_compact = !compact_calls.is_empty() && tool_calls.is_empty();
                 let calls = tool_calls;
                 gate.lock().unwrap().finish_text();
                 let mut results = String::new();
@@ -291,14 +284,6 @@ pub async fn agent_loop(ctx: SubLoopCtx) -> LoopOutcome {
                         "phase": "done", "call_id": call_id, "name": call.name, "error": !ok,
                     }));
                     results.push_str(&format!("<tool_result name=\"{}\">\n{}\n</tool_result>\n", call.name, body));
-                }
-                if want_complete {
-                    let summary = done_calls.iter()
-                        .filter_map(|c| c.params.get("summary"))
-                        .map(|s| s.trim().to_string())
-                        .find(|s| !s.is_empty())
-                        .unwrap_or_default();
-                    return LoopOutcome { text: summary, ok: true, reason: None };
                 }
                 if want_compact {
                     // 防滥用：本会话消息数过少（<10）时忽略请求。
@@ -543,9 +528,7 @@ pub async fn run_subagent(
     {
         let inner = state.inner.lock().await;
         if let Some(r) = inner.sub_runs.get(&sub_id) {
-            if matches!(r.status, SubRunStatus::Starting | SubRunStatus::Running)
-                && !r.rate_limited_suspended
-            {
+            if matches!(r.status, SubRunStatus::Starting | SubRunStatus::Running) {
                 return Err(format!("子 agent「{}」正在运行中", spec.name));
             }
         }
@@ -606,8 +589,6 @@ pub async fn run_subagent(
             attempts: 0,
             last_text: None,
             last_ok: None,
-            missing_completion_count: 0,
-            rate_limited_suspended: false,
             last_task: spec.task.clone(),
         });
         gen

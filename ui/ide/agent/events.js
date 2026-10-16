@@ -34,12 +34,6 @@ export function installAgentEvents(store, onBusy) {
     store.finish();
   });
 
-  on("agent://ask", (p) => {
-    if (p.project_id !== pid) return;
-    store.appendAssistant(p.question || "");
-    store.setRunning(false);
-  });
-
   on("agent://error", (p) => {
     if (p.project_id !== pid) return;
     store.error(p.user_message || p.message);
@@ -57,12 +51,6 @@ export function installAgentEvents(store, onBusy) {
     if (onBusy) onBusy(!!p.busy);
   });
 
-  on("agent://rate-limit", (p) => {
-    if (p.project_id !== pid) return;
-    store.setRateLimit(!!p.suspended, p.next_retry_at);
-    if (p.suspended) store.addNotice("⚠ 检测到限流，任务已挂起，将在倒计时结束后自动重试。点停止可中断等待并接管。");
-    else store.addNotice("限流等待已结束，继续执行。");
-  });
 
   on("agent://sub-start", (p) => { if (p.project_id === pid) store.subStart(p.sub_id, p.name, p.duty, p.run_generation); });
   on("agent://sub-done", (p) => { if (p.project_id === pid) store.subDone(p.sub_id, p.name, p.ok, p.reason, p.result, p.run_generation); });
@@ -76,7 +64,6 @@ export function installAgentEvents(store, onBusy) {
     core.invoke("get_project_runtime", { projectId: pid }).then((rt) => {
       if (!rt) return;
       if (rt.turn_active && rt.busy) store.setRunning(true);
-      if (rt.rate_limited_suspended) store.setRateLimit(true, rt.next_retry_at);
       store.subSync(rt.sub_runs || []);
     }).catch(() => {});
   }

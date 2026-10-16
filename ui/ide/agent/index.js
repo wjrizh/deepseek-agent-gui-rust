@@ -14,7 +14,6 @@ let sendBtn = null;
 let stopBtn = null;
 let uninstallEvents = null;
 let onBusyCb = null;
-let statusTimer = null;
 
 function ensureBuilt() {
   if (rootEl) return;
@@ -29,17 +28,7 @@ function renderStatusBar() {
   if (!bar || !store) return;
   const c = store.subCountText();
   const subText = c.total ? "子agent " + c.running + "/" + c.total : "";
-  if (store.rateLimited) {
-    let tip = "限流挂起，等待自动重试";
-    if (store.nextRetryAt) {
-      const left = Math.max(0, store.nextRetryAt - Math.floor(Date.now() / 1000));
-      const m = Math.floor(left / 60), s = left % 60;
-      tip += "（" + m + ":" + String(s).padStart(2, "0") + " 后重试；点停止可接管）";
-    }
-    bar.textContent = tip + (subText ? " · " + subText : "");
-  } else {
-    bar.textContent = subText;
-  }
+  bar.textContent = subText;
 }
 
 const subHandlers = {
@@ -94,12 +83,6 @@ export function initAgent({ projectId, onBusy }) {
   store.subscribe(rerender);
   uninstallEvents = installAgentEvents(store, onBusy);
   onBusyCb = onBusy;
-  // 每秒刷新限流倒计时（仅在挂起时变化）。
-  if (!statusTimer) {
-    statusTimer = setInterval(() => {
-      if (store && store.rateLimited) renderStatusBar();
-    }, 1000);
-  }
 
   sendBtn?.addEventListener("click", doSend);
   stopBtn?.addEventListener("click", () => {
@@ -112,7 +95,6 @@ export function initAgent({ projectId, onBusy }) {
 
 export function disposeAgent() {
   if (uninstallEvents) { uninstallEvents(); uninstallEvents = null; }
-  if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
   store = null; rootEl = null; inputEl = null; sendBtn = null; stopBtn = null;
 }
 

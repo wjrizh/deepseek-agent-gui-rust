@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 
 /// 已知工具名（唯一真源；新增工具需在此登记 + 实现 `Tool`）。
-pub const KNOWN_TOOLS: &[&str] = &["execute_command", "upload_file", "browser", "read_file", "write_file", "edit_file", "sub_agent", "task_complete", "ask_user", "request_context_compaction"];
+pub const KNOWN_TOOLS: &[&str] = &["execute_command", "upload_file", "browser", "read_file", "write_file", "edit_file", "sub_agent", "request_context_compaction"];
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -874,14 +874,6 @@ fn validate(name: &str, params: &HashMap<String, String>) -> std::result::Result
             }
             Ok(())
         }
-        "ask_user" => {
-            let q = params.get("question").map(|s| s.trim()).unwrap_or("");
-            if q.is_empty() {
-                return Err("缺少非空的 <question> 参数".into());
-            }
-            Ok(())
-        }
-        "task_complete" => Ok(()),
         "request_context_compaction" => Ok(()),
         _ => Err(format!("未知工具: {name}，可用工具: {}", KNOWN_TOOLS.join(", "))),
     }

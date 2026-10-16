@@ -93,6 +93,12 @@ pub struct ProjectStore {
     /// 每项目是否预启动主 bridge（默认关，减少启动延迟）。key=project_id。
     #[serde(default)]
     pub warmup_by_project: std::collections::HashMap<String, bool>,
+    /// 每项目深度思考开关（持久化）。缺省 false。
+    #[serde(default)]
+    pub thinking_by_project: std::collections::HashMap<String, bool>,
+    /// 每项目联网搜索开关（持久化）。缺省 false。
+    #[serde(default)]
+    pub search_by_project: std::collections::HashMap<String, bool>,
     #[serde(default)]
     pub conversation_seq: u64,
     /// 存储格式版本号，用于未来迁移与兼容判断。
@@ -350,6 +356,22 @@ impl ProjectStore {
 
     pub fn set_free_mode_of(&mut self, project_id: &str, free: bool) {
         self.free_by_project.insert(project_id.to_string(), free);
+    }
+
+    pub fn thinking_of(&self, project_id: &str) -> bool {
+        self.thinking_by_project.get(project_id).copied().unwrap_or(false)
+    }
+
+    pub fn set_thinking_of(&mut self, project_id: &str, on: bool) {
+        self.thinking_by_project.insert(project_id.to_string(), on);
+    }
+
+    pub fn search_of(&self, project_id: &str) -> bool {
+        self.search_by_project.get(project_id).copied().unwrap_or(false)
+    }
+
+    pub fn set_search_of(&mut self, project_id: &str, on: bool) {
+        self.search_by_project.insert(project_id.to_string(), on);
     }
 
     pub fn save(&self) -> Result<(), String> {

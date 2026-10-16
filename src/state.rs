@@ -54,14 +54,6 @@ pub struct RunCtx {
     pub turn_gen: u64,
     /// 本轮是否被用户请求取消。为真时收尾不得自动唤起审阅 turn。
     pub cancel_requested: bool,
-    /// 连续"缺完成信号"计数（出现合法完成信号/工具调用即清零）。
-    pub missing_completion_count: u32,
-    /// 是否因限流挂起（等待 10 分钟重试）。
-    pub rate_limited_suspended: bool,
-    /// 限流等待代数。自增即作废旧的等待任务（人工接管/新 turn 时）。
-    pub rate_limit_wait_seq: u64,
-    /// 限流挂起时下次自动重试的时间（Unix 秒），供前端倒计时。
-    pub rate_limit_retry_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -90,10 +82,6 @@ pub struct SubRunCtx {
     pub attempts: u8,
     pub last_text: Option<String>,
     pub last_ok: Option<bool>,
-    /// 连续"缺完成信号"计数（出现合法完成信号/工具调用即清零）。
-    pub missing_completion_count: u32,
-    /// 是否因限流挂起。
-    pub rate_limited_suspended: bool,
     /// 最近一次派发的任务文本，供"重试"原样重派。
     pub last_task: String,
 }
@@ -295,6 +283,8 @@ impl AppState {
                     .and_then(|c| c.last_parent_id)
             });
         let persisted_free = inner.projects.free_mode_of(project_id);
+        let persisted_thinking = inner.projects.thinking_of(project_id);
+        let persisted_search = inner.projects.search_of(project_id);
         if let Some(ctx) = inner.running.get_mut(project_id) {
             if ctx.session.session_id.is_none() {
                 ctx.session.session_id = persisted_sid;
@@ -303,6 +293,8 @@ impl AppState {
                 ctx.session.parent_message_id = persisted_parent;
             }
             ctx.session.free_mode = persisted_free;
+            ctx.session.thinking = persisted_thinking;
+            ctx.session.search = persisted_search;
             let model = ctx.model.clone();
             drop(inner);
             self.touch_bridge(&account).await;
@@ -312,6 +304,8 @@ impl AppState {
         session.session_id = persisted_sid;
         session.parent_message_id = persisted_parent;
         session.free_mode = persisted_free;
+        session.thinking = persisted_thinking;
+        session.search = persisted_search;
         inner.running.insert(
             project_id.to_string(),
             RunCtx {
@@ -324,10 +318,6 @@ impl AppState {
                 turn_active: false,
                 turn_gen: 0,
                 cancel_requested: false,
-                missing_completion_count: 0,
-                rate_limited_suspended: false,
-                rate_limit_wait_seq: 0,
-                rate_limit_retry_at: None,
             },
         );
         drop(inner);

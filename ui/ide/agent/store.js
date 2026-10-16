@@ -9,10 +9,6 @@ export function createStore(projectId) {
     curAssistant: null,    // 当前流式助手消息对象（引用 messages 中一项）
     curTool: null,         // 当前工具卡片数据对象
     toolByCallId: new Map(),
-    subAgents: new Map(),
-    subToolById: new Map(),
-    rateLimited: false,    // 限流挂起等待自动重试
-    nextRetryAt: null,     // 下次重试时间（Unix 秒）
     listeners: new Set(),
 
     subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); },
@@ -174,13 +170,6 @@ export function createStore(projectId) {
 
     setRunning(on) {
       this.running = !!on;
-      this.emitChange();
-    },
-
-    // 限流挂起态：suspended=true 时记录下次重试时间，供倒计时。
-    setRateLimit(suspended, nextRetryAt) {
-      this.rateLimited = !!suspended;
-      this.nextRetryAt = suspended ? (nextRetryAt || null) : null;
       this.emitChange();
     },
   };

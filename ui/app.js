@@ -58,6 +58,8 @@ function showProject(pid) {
     v.el.scrollTop = v.el.scrollHeight;
   }
   invoke("get_mode", { projectId: pid }).then((free) => { const vv = view(pid); vv.freeMode = !!free; if (activeProjectId === pid) applyMode(free); }).catch(() => {});
+  invoke("get_thinking", { projectId: pid }).then((on) => { if (activeProjectId === pid) applyThink(on); }).catch(() => {});
+  invoke("get_search", { projectId: pid }).then((on) => { if (activeProjectId === pid) applySearch(on); }).catch(() => {});
   invoke("get_workdir", { projectId: pid }).then((d) => {
     const el = document.getElementById("workdir-input");
     if (el) el.value = d;
@@ -423,19 +425,6 @@ listen("agent://error", (e) => {
   msgEl.appendChild(bar);
   v.running = false;
   if (project_id === activeProjectId) setRunning(false);
-});
-
-listen("agent://ask", (e) => {
-  const p = e.payload || {};
-  if (p.project_id !== activeProjectId) return;
-  const v = view(activeProjectId);
-  if (v) {
-    hideThinking(v);
-    addMsg(v, "assistant", p.question || "");
-    v.running = false;
-    flushRender(v);
-  }
-  setRunning(false);
 });
 
 listen("agent://approval", (e) => {
