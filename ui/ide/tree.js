@@ -2,7 +2,7 @@
 // 懒加载目录、展开/折叠、点击文件回调、搜索、上一层、多选、键盘导航。
 // 对外保持 createTree/fileIcon 及原有 13 个方法的签名不变。
 
-import { listDir } from "./api.js";
+import { listDir, searchContent as searchContentApi } from "./api.js";
 
 // —— SVG 图标 ——
 const SVG_FOLDER = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none"><path d="M3 6.5A1.5 1.5 0 014.5 5h4l2 2h7A1.5 1.5 0 0119 8.5v8A1.5 1.5 0 0117.5 18h-13A1.5 1.5 0 013 16.5v-10z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>';
@@ -852,8 +852,68 @@ export function createTree(host, projectId, onOpenFile, restrict, opts = {}) {
     }
   }
 
+  // 内容搜索结果渲染：按文件分组，行级命中。
+  function renderContentHits(hits) {
+    host.innerHTML = "";
+    if (!hits || !hits.length) {
+      const empty = document.createElement("div");
+      empty.className = "tree-error";
+      empty.textContent = "无内容匹配";
+      host.appendChild(empty);
+      return;
+    }
+    const groups = new Map();
+    for (const h of hits) {
+      if (!groups.has(h.rel)) groups.set(h.rel, []);
+      groups.get(h.rel).push(h);
+    }
+    for (const [rel, list] of groups) {
+      const fileRow = document.createElement("div");
+      fileRow.className = "tree-row search-hit search-file";
+      fileRow.dataset.rel = rel;
+      const name = rel.split("/").pop();
+      const ic = iconFor({ name, is_dir: false }, false);
+      fileRow.innerHTML = '<span class="tree-twisty empty"></span><span class="tree-icon" style="color:' + ic.color + '">' + ic.svg + '</span><span class="tree-label" title="' + rel + '">' + rel + '</span><span class="search-cnt">' + list.length + '</span>';
+      fileRow.addEventListener("click", () => onOpenFile(rel, name));
+      host.appendChild(fileRow);
+      for (const h of list.slice(0, 50)) {
+        const lineRow = document.createElement("div");
+        lineRow.className = "tree-row search-line";
+        lineRow.dataset.rel = rel;
+        lineRow.dataset.line = String(h.line);
+        const text = (h.text || "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
+        lineRow.innerHTML = '<span class="search-ln">' + h.line + "</span><span class=\"search-text\" title=\"" + rel + ":" + h.line + "\">" + text + "</span>";
+        lineRow.addEventListener("click", () => onOpenFile(rel, name, { line: h.line }));
+        host.appendChild(lineRow);
+      }
+    }
+  }
+
+  async function searchContent(query) {
+    const q = (query || "").trim();
+    if (!q) {
+      nodeMap.clear();
+      state.clear();
+      selection.clear();
+      await refresh();
+      return;
+    }
+    let hits;
+    try {
+      hits = await searchContentApi(projectId, q);
+    } catch (err) {
+      host.innerHTML = "";
+      const e = document.createElement("div");
+      e.className = "tree-error";
+      e.textContent = "搜索失败：" + (err && err.message ? err.message : err);
+      host.appendChild(e);
+      return;
+    }
+    renderContentHits(hits);
+  }
+
   return {
-    refresh, goUp, search, setRoot, getRoot: () => rootRel,
+    refresh, goUp, search, searchContent, setRoot, getRoot: () => rootRel,
     getSelection, clearSelection, startRename, selectSingle, setDirty,
     applyChanges, reveal, moveNode, removeNode,
   };

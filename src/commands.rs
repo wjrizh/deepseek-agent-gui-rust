@@ -1507,6 +1507,9 @@ pub async fn clear_pending_files(
 #[tauri::command]
 pub async fn get_workdir(project_id: String, state: State<'_, AppState>) -> Result<String, String> {
     let inner = state.inner.lock().await;
+    if let Some(spec) = inner.projects.remote_of(&project_id) {
+        return Ok(spec.root);
+    }
     Ok(inner.projects.workdir_of(&project_id).unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_default()

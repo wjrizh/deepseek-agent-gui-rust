@@ -70,7 +70,12 @@ pub fn shell_invocation_ex(cmd: &str, script: Option<&PathBuf>) -> (String, Vec<
     }
     #[cfg(not(windows))]
     {
-        let use_sudo = !is_root_unix() && can_sudo_unix();
+        // 默认不自动提权：普通命令以 GUI 进程用户执行，文件属主与 write_file/edit_file 一致。
+        // 需要 root 时由 agent 在命令中显式写 sudo（本机 wheel 免密，不弹密码）。
+        // 设 LIGONG_SUDO=1 可恢复"所有命令自动 sudo"的旧行为。
+        let use_sudo = std::env::var("LIGONG_SUDO").map(|v| v == "1").unwrap_or(false)
+            && !is_root_unix()
+            && can_sudo_unix();
         if let Some(path) = script {
             if use_sudo {
                 return (

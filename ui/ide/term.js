@@ -38,7 +38,8 @@ export function fitTerminal() {
 
 export function setTerminalCwdProvider(fn) { getCwd = fn || (() => ""); }
 
-export function newTerminal() {
+export function newTerminal(opts) {
+  opts = opts || {};
   const id = "term-" + (++seq);
   const host = document.createElement("div");
   host.className = "term-host";
@@ -75,7 +76,7 @@ export function newTerminal() {
   const tabEl = document.createElement("div");
   tabEl.className = "term-tab";
   const label = document.createElement("span");
-  label.textContent = "终端 " + seq;
+  label.textContent = opts.label || ("终端 " + seq);
   const close = document.createElement("span");
   close.className = "term-close";
   close.textContent = "✕";
@@ -101,7 +102,7 @@ export function newTerminal() {
       if (!ev) return;
       if (ev.kind === "data") term.write(ev.data);
       else if (ev.kind === "exit") term.write("\r\n[进程已退出]\r\n");
-    }).catch((e) => {
+    }, opts.prog || null, opts.args || null).catch((e) => {
       term.write("\r\n终端启动失败：" + e + "\r\n");
     });
   });
@@ -130,11 +131,26 @@ export async function closeTerminal(id) {
   }
 }
 
-export function initTerminal({ projectId, cwdProvider }) {
+// 打开一个远程终端（ssh/tailscale ssh）。prog 与 args 透传给 PTY。
+export function newRemoteTerminal(prog, args, label) {
+  return newTerminal({ prog, args, label });
+}
+
+export function initTerminal({ projectId, cwdProvider, onRemoteNew }) {
   tabsEl = document.getElementById("term-tabs");
   hostsEl = document.getElementById("term-hosts");
   getCwd = cwdProvider || (() => "");
   if (!tabsEl || !hostsEl) return;
 
   document.getElementById("term-new")?.addEventListener("click", () => newTerminal());
+
+  const remoteBtn = document.getElementById("term-remote");
+  if (remoteBtn) {
+    if (onRemoteNew) {
+      remoteBtn.style.display = "";
+      remoteBtn.addEventListener("click", () => onRemoteNew());
+    } else {
+      remoteBtn.style.display = "none";
+    }
+  }
 }

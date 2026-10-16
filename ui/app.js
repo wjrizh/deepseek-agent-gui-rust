@@ -494,6 +494,102 @@ inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKe
 inputEl.addEventListener("input", () => { inputEl.style.height = "auto"; inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px"; });
 stopBtn.onclick = () => invoke("interrupt", { projectId: activeProjectId || "" }).catch(() => {});
 
+// —— 远程目录选择器（项目创建 / 切换工作目录共用）——
+let dirCurPath = "";
+let dirSpec = null;
+let dirOnPick = null;
+
+function applyDirFilter() {
+  const q = (document.getElementById("dir-search")?.value || "").trim().toLowerCase();
+  document.querySelectorAll("#dir-list .dir-item").forEach((row) => {
+    const hit = !q || (row.dataset.name || "").toLowerCase().includes(q);
+    row.style.display = hit ? "" : "none";
+  });
+}
+
+async function dirLoad(path) {
+  const list = document.getElementById("dir-list");
+  const pathEl = document.getElementById("dir-path");
+  const searchEl = document.getElementById("dir-search");
+  list.innerHTML = '<div style="padding:10px;color:#888">加载中…</div>';
+  try {
+    const res = await invoke("remote_browse", { spec: dirSpec, path: path || "" });
+    dirCurPath = (res && res.path) ? res.path : "";
+    pathEl.value = dirCurPath || "";
+    if (searchEl) searchEl.value = "";
+    const dirs = (res && res.dirs) ? res.dirs : [];
+    list.innerHTML = "";
+    if (!dirs.length) {
+      const e = document.createElement("div");
+      e.style.cssText = "padding:10px;color:#888";
+      e.textContent = "（无子目录）";
+      list.appendChild(e);
+      return;
+    }
+    for (const d of dirs) {
+      const row = document.createElement("div");
+      row.className = "dir-item";
+      row.dataset.path = d;
+      row.dataset.name = d.split(/[\\/]/).filter(Boolean).pop() || d;
+      row.innerHTML = '<span>📁</span><span class="dir-name"></span>';
+      row.querySelector(".dir-name").textContent = row.dataset.name;
+      row.title = d;
+      row.addEventListener("click", () => dirLoad(d));
+      list.appendChild(row);
+    }
+    applyDirFilter();
+  } catch (e) {
+    list.innerHTML = "";
+    const er = document.createElement("div");
+    er.style.cssText = "padding:10px;color:#e66";
+    er.textContent = "浏览失败：" + e;
+    list.appendChild(er);
+  }
+}
+
+function dirParent(p) {
+  if (!p) return "";
+  const norm = p.replace(/[\\/]+$/, "");
+  if (/^[A-Za-z]:$/.test(norm)) return norm + "\\";
+  const i = Math.max(norm.lastIndexOf("/"), norm.lastIndexOf("\\"));
+  if (i < 0) return "";
+  if (i === 0) return norm.startsWith("/") ? "/" : "";
+  const parent = norm.slice(0, i);
+  if (/^[A-Za-z]:$/.test(parent)) return parent + "\\";
+  return parent;
+}
+
+function openRemoteDirPicker(spec, onPick, startPath) {
+  dirSpec = spec;
+  dirOnPick = onPick;
+  dirCurPath = "";
+  document.getElementById("dir-modal").classList.remove("hidden");
+  dirLoad(startPath || "");
+}
+
+document.getElementById("dir-up")?.addEventListener("click", () => dirLoad(dirParent(dirCurPath)));
+document.getElementById("dir-go")?.addEventListener("click", () => dirLoad(document.getElementById("dir-path").value.trim()));
+document.getElementById("dir-path")?.addEventListener("keydown", (e) => { if (e.key === "Enter") dirLoad(e.target.value.trim()); });
+document.getElementById("dir-search")?.addEventListener("input", applyDirFilter);
+document.getElementById("dir-cancel")?.addEventListener("click", () => document.getElementById("dir-modal").classList.add("hidden"));
+document.getElementById("dir-ok")?.addEventListener("click", () => {
+  const p = dirCurPath || document.getElementById("dir-path").value.trim();
+  if (!p) { iosToast("请先进入一个目录再选择"); return; }
+  document.getElementById("dir-modal").classList.add("hidden");
+  if (dirOnPick) dirOnPick(p);
+});
+document.getElementById("project-remote-browse")?.addEventListener("click", () => {
+  const aliasEl = document.getElementById("project-remote-alias").value.trim();
+  const hostEl = document.getElementById("project-remote-host").value.trim();
+  const userEl = document.getElementById("project-remote-user").value.trim();
+  const portV = document.getElementById("project-remote-port").value.trim();
+  if (!aliasEl && !hostEl) { iosToast("请先选择目标主机"); return; }
+  const spec = { host: hostEl, user: userEl || null, port: portV ? parseInt(portV, 10) : null,
+    root: "", ssh_alias: aliasEl || null, proxy_jump: null, restrict: false };
+  const rootEl = document.getElementById("project-remote-root");
+  openRemoteDirPicker(spec, (p) => { rootEl.value = p; }, "");
+});
+
 // 工作目录栏
 const workdirInput = document.getElementById("workdir-input");
 const restrictToggle = document.getElementById("restrict-toggle");
@@ -501,6 +597,22 @@ const restrictCheck = document.getElementById("restrict-check");
 if (workdirInput) {
   workdirInput.onclick = async () => {
     if (!activeProjectId) { iosToast("请先选择一个项目"); return; }
+    let spec = null;
+    try { spec = await invoke("get_project_remote", { projectId: activeProjectId }); } catch {}
+    if (spec) {
+      openRemoteDirPicker(spec, async (newRoot) => {
+        try {
+          await invoke("set_project_remote", { projectId: activeProjectId, spec: {
+            host: spec.host, user: spec.user || null, port: spec.port || null,
+            root: newRoot, ssh_alias: spec.ssh_alias || null,
+            proxy_jump: spec.proxy_jump || null, restrict: !!spec.restrict,
+          } });
+          workdirInput.value = newRoot;
+          iosToast("远程工作目录已切换");
+        } catch (e) { iosToast("切换失败：" + e); }
+      }, spec.root || "");
+      return;
+    }
     try {
       const dlg = window.__TAURI__.dialog;
       const picked = await dlg.open({ directory: true, multiple: false, defaultPath: workdirInput.value || undefined });
@@ -997,6 +1109,16 @@ function openProjectModal(mode, id, curName) {
   } else {
     document.getElementById("project-account").classList.add("hidden");
   }
+  const rTgl = document.getElementById("project-remote-toggle");
+  const rFields = document.getElementById("project-remote-fields");
+  if (mode === "create" && rTgl && rFields) {
+    rTgl.classList.remove("hidden");
+    document.getElementById("project-remote-check").checked = false;
+    rFields.classList.add("hidden");
+  } else if (rTgl && rFields) {
+    rTgl.classList.add("hidden");
+    rFields.classList.add("hidden");
+  }
   projectModal.classList.remove("hidden");
   projectModalName.focus();
 }
@@ -1011,6 +1133,20 @@ projectModalOk.onclick = async () => {
       const account = selectedAccount;
       if (!account) { iosToast("请选择账号"); return; }
       const pv = await invoke("create_project", { name, account });
+      const rCheck = document.getElementById("project-remote-check");
+      if (rCheck && rCheck.checked) {
+        const alias = document.getElementById("project-remote-alias").value.trim();
+        const host = document.getElementById("project-remote-host").value.trim();
+        const user = document.getElementById("project-remote-user").value.trim();
+        const portV = document.getElementById("project-remote-port").value.trim();
+        const root = document.getElementById("project-remote-root").value.trim();
+        if (!alias && !host) { iosToast("请选择目标主机"); return; }
+        if (!root) { iosToast("远程项目需填远程根目录"); return; }
+        await invoke("set_project_remote", { projectId: pv.id, spec: {
+          host, user: user || null, port: portV ? parseInt(portV, 10) : null,
+          root, ssh_alias: alias || null, proxy_jump: null, restrict: false,
+        } });
+      }
       closeProjectModal();
       activeProjectId = pv.id;
       showProject(pv.id);
@@ -1026,6 +1162,58 @@ projectModalOk.onclick = async () => {
   } catch (e) { iosToast("操作失败：" + e); }
 };
 projectModalName.addEventListener("keydown", (e) => { if (e.key === "Enter") projectModalOk.click(); });
+function fillRemoteTargets() {
+  const sel = document.getElementById("project-remote-target");
+  const hint = document.getElementById("project-remote-hint");
+  if (!sel) return;
+  sel.innerHTML = '<option value="">— 选择 SSH 主机 / Tailscale 设备 —</option>';
+  invoke("remote_ssh_hosts").then((hosts) => {
+    for (const h of (hosts || [])) {
+      const o = document.createElement("option");
+      o.value = "ssh:" + JSON.stringify(h);
+      o.textContent = "SSH: " + h.alias + (h.hostname && h.hostname !== h.alias ? " → " + h.hostname : "");
+      sel.appendChild(o);
+    }
+  }).catch(() => {});
+  invoke("remote_tailscale_devices").then((devs) => {
+    for (const d of (devs || [])) {
+      if (d.is_self) continue;
+      const o = document.createElement("option");
+      o.value = "ts:" + JSON.stringify(d);
+      o.textContent = "Tailscale: " + d.name + (d.online ? "" : "（离线）");
+      sel.appendChild(o);
+    }
+  }).catch((e) => { if (hint) hint.textContent = "Tailscale 不可用：" + e; });
+}
+document.getElementById("project-remote-check")?.addEventListener("change", (e) => {
+  const f = document.getElementById("project-remote-fields");
+  if (f) f.classList.toggle("hidden", !e.target.checked);
+  if (e.target.checked) fillRemoteTargets();
+});
+document.getElementById("project-remote-target")?.addEventListener("change", (e) => {
+  const v = e.target.value;
+  if (!v) return;
+  const isSsh = v.startsWith("ssh:");
+  const aliasEl = document.getElementById("project-remote-alias");
+  const hostEl = document.getElementById("project-remote-host");
+  const portEl = document.getElementById("project-remote-port");
+  const userEl = document.getElementById("project-remote-user");
+  try {
+    const obj = JSON.parse(v.slice(isSsh ? 4 : 3));
+    if (isSsh) {
+      aliasEl.value = obj.alias || "";
+      hostEl.value = obj.hostname || "";
+      portEl.value = obj.port || "";
+      if (obj.user) userEl.value = obj.user;
+    } else {
+      aliasEl.value = "";
+      hostEl.value = obj.dns_name || obj.ip || "";
+      portEl.value = "";
+    }
+  } catch (err) {
+    iosToast("解析主机信息失败：" + err);
+  }
+});
 
 async function renderProjects() {
   let projects = [];

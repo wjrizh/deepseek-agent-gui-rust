@@ -33,6 +33,8 @@ pub struct SubLoopCtx {
     pub first_input: String,
     pub prompt_already_sent: bool,
     pub workdir: String,
+    pub remote_spec: Option<crate::projects::RemoteSpec>,
+    pub is_win_remote: bool,
     pub compact_threshold: i64,
     pub run_generation: u64,
 }
@@ -89,7 +91,7 @@ fn build_prompt(ctx: &SubLoopCtx, input: &str) -> String {
     } else {
         format!(
             "{}\n\n{}\n\n{}\n\n{}",
-            crate::prompt_gui::system_prompt_with_env(),
+            crate::prompt_gui::system_prompt_with_remote(ctx.remote_spec.as_ref(), ctx.is_win_remote),
             crate::prompt_gui::SUBAGENT_PROMPT,
             crate::prompt_gui::SUBAGENT_TOOLS_SECTION,
             input
@@ -154,7 +156,7 @@ pub async fn agent_loop(ctx: SubLoopCtx) -> LoopOutcome {
                 session_id = new_sid;
                 next_prompt = format!(
                     "{}\n\n{}\n\n{}\n{}\n===== 交接报告结束 =====\n\n{}",
-                    crate::prompt_gui::system_prompt_with_env(),
+                    crate::prompt_gui::system_prompt_with_remote(ctx.remote_spec.as_ref(), ctx.is_win_remote),
                     crate::prompt_gui::SUBAGENT_TOOLS_SECTION,
                     HANDOFF_INTRO,
                     report,
@@ -633,11 +635,21 @@ pub async fn run_subagent(
         };
 
     let cancel = CancellationToken::new();
-    let workdir = {
+    let remote_spec = {
+        let inner = state.inner.lock().await;
+        inner.projects.remote_of(&spec.project_id)
+    };
+    let workdir = if let Some(s) = &remote_spec {
+        s.root.clone()
+    } else {
         let inner = state.inner.lock().await;
         inner.projects.workdir_of(&spec.project_id).unwrap_or_else(|| {
             dirs::home_dir().unwrap_or_default().to_string_lossy().to_string()
         })
+    };
+    let is_win_remote = match &remote_spec {
+        Some(s) => crate::ide::backend::is_windows_remote(s).await,
+        None => false,
     };
     let compact_threshold = {
         let inner = state.inner.lock().await;
@@ -693,6 +705,8 @@ pub async fn run_subagent(
         first_input: spec.task.clone(),
         prompt_already_sent,
         workdir,
+        remote_spec,
+        is_win_remote,
         compact_threshold,
         run_generation,
     };

@@ -13,6 +13,48 @@ export function readFile(projectId, relPath) {
   return invoke("ide_read_file", { projectId, relPath });
 }
 
+// 内容搜索（本地 rg/grep，远程 ssh）。
+export function searchContent(projectId, query) {
+  return invoke("ide_search_content", { projectId, query });
+}
+
+// —— 远程文件传输（仅远程项目）——
+export function uploadPaths(projectId, localPaths, relDir) {
+  return invoke("ide_upload_paths", { projectId, localPaths, relDir: relDir || "" });
+}
+
+export function downloadFile(projectId, relPath, localPath) {
+  return invoke("ide_download_file", { projectId, relPath, localPath });
+}
+
+// —— 远程端口转发 ——
+export function forwardOpen(opts) {
+  return invoke("remote_forward_open", opts);
+}
+
+export function forwardClose(localPort) {
+  return invoke("remote_forward_close", { localPort });
+}
+
+export function forwardList() {
+  return invoke("remote_forward_list");
+}
+
+// 读取项目远程规格（None=本地）。
+export function getProjectRemote(projectId) {
+  return invoke("get_project_remote", { projectId });
+}
+
+// 更新项目远程规格（host/user/port/root 等）。
+export function setProjectRemote(projectId, spec) {
+  return invoke("set_project_remote", { projectId, spec });
+}
+
+// 远程交互终端的启动参数（prog/args/label/root）。
+export function remoteTerminalArgv(projectId) {
+  return invoke("remote_terminal_argv", { projectId });
+}
+
 export function writeFile(projectId, relPath, content) {
   return invoke("ide_write_file", { projectId, relPath, content });
 }
@@ -176,10 +218,14 @@ export function setRestrict(projectId, on) {
 // —— 内置终端 ——
 const ChannelCtor = window.__TAURI__.core.Channel;
 
-export function termOpen(id, cwd, shell, cols, rows, onEvent) {
+export function termOpen(id, cwd, shell, cols, rows, onEvent, prog, args) {
   const channel = new ChannelCtor();
   channel.onmessage = onEvent;
-  return invoke("term_open", { id, cwd: cwd || null, shell: shell || null, cols, rows, onEvent: channel });
+  return invoke("term_open", {
+    id, cwd: cwd || null, shell: shell || null,
+    prog: prog || null, args: args || null,
+    cols, rows, onEvent: channel,
+  });
 }
 
 export function termWrite(id, data) {

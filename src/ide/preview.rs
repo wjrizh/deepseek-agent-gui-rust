@@ -52,6 +52,12 @@ fn mime_for_path(path: &std::path::Path) -> String {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    mime_for_ext(&ext)
+}
+
+/// 按扩展名（不含点）推测 MIME 类型。
+fn mime_for_ext(ext: &str) -> String {
+    let ext = ext.rsplit('.').next().unwrap_or(ext).to_ascii_lowercase();
     match ext.as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -74,6 +80,15 @@ pub async fn ide_read_binary(
     rel_path: String,
     state: State<'_, AppState>,
 ) -> Result<BinaryData, String> {
+    if let Some(spec) = {
+        let inner = state.inner.lock().await;
+        inner.projects.remote_of(&project_id)
+    } {
+        let (bytes, size) = crate::ide::backend::read_binary(&spec, &rel_path).await?;
+        let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let mime = mime_for_ext(&rel_path);
+        return Ok(BinaryData { mime, base64, size });
+    }
     let root = project_root(&state, &project_id).await?;
     let restrict = project_restrict(&state, &project_id).await;
     let file = path::resolve(&root, &rel_path, restrict, false)?;

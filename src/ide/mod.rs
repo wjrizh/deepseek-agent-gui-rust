@@ -5,10 +5,17 @@
 //! - `fs`：列目录 / 读文件 / 写文件命令。
 //! - `window`：打开 / 复用 IDE 独立窗口。
 
+pub mod backend;
+pub mod backend_win;
+pub mod forward;
 pub mod fs;
 pub mod git;
 pub mod path;
 pub mod preview;
+pub mod remote;
+pub mod search;
+pub mod transfer;
+pub mod ssh;
 pub mod term;
 pub mod watch;
 pub mod window;

@@ -66,6 +66,30 @@ fn default_sub_account_mode() -> String {
     "permanent".to_string()
 }
 
+/// 远程项目规格（SSH）。仅存非秘密配置；密码/私钥内容绝不入此。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteSpec {
+    /// 主机地址（IP 或域名）。
+    pub host: String,
+    /// 登录用户名；缺省用本机 ssh 默认。
+    #[serde(default)]
+    pub user: Option<String>,
+    /// SSH 端口；缺省 22。
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// 远程工作根目录（POSIX 绝对路径）。
+    pub root: String,
+    /// 若来自 ~/.ssh/config，记录别名，便于复用其 HostName/User/Port/ProxyJump。
+    #[serde(default)]
+    pub ssh_alias: Option<String>,
+    /// ProxyJump 跳板（形如 user@host），可选。
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
+    /// 是否对远程 root 启用越界保护。
+    #[serde(default)]
+    pub restrict: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectStore {
     #[serde(default)]
@@ -97,6 +121,9 @@ pub struct ProjectStore {
     /// 每项目联网搜索开关（持久化）。缺省 false。
     #[serde(default)]
     pub search_by_project: std::collections::HashMap<String, bool>,
+    /// 每项目远程规格（持久化）。缺省=本地项目。key=project_id。
+    #[serde(default)]
+    pub remote_by_project: std::collections::HashMap<String, RemoteSpec>,
     #[serde(default)]
     pub conversation_seq: u64,
     /// 存储格式版本号，用于未来迁移与兼容判断。
@@ -471,6 +498,25 @@ impl ProjectStore {
 
     pub fn set_warmup_of(&mut self, project_id: &str, on: bool) {
         self.warmup_by_project.insert(project_id.to_string(), on);
+    }
+
+    /// 返回该项目的远程规格；None=本地项目。
+    pub fn remote_of(&self, project_id: &str) -> Option<RemoteSpec> {
+        self.remote_by_project.get(project_id).cloned()
+    }
+
+    pub fn set_remote_of(&mut self, project_id: &str, spec: RemoteSpec) {
+        self.remote_by_project
+            .insert(project_id.to_string(), spec);
+    }
+
+    pub fn clear_remote_of(&mut self, project_id: &str) {
+        self.remote_by_project.remove(project_id);
+    }
+
+    /// 该项目是否为远程项目。
+    pub fn is_remote(&self, project_id: &str) -> bool {
+        self.remote_by_project.contains_key(project_id)
     }
 
     pub fn project(&self, id: &str) -> Option<&Project> {

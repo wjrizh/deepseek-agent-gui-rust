@@ -125,6 +125,26 @@
     </div>
   </div>
 
+  <!-- 远程目录选择器 -->
+  <div id="dir-modal" class="modal-overlay hidden">
+    <div class="modal dir-modal">
+      <div class="modal-title">选择远程目录</div>
+      <div class="dir-toolbar">
+        <button id="dir-up" class="modal-btn" title="上一层">↑ 上层</button>
+        <input id="dir-path" class="modal-input dir-path-input" placeholder="绝对路径，回车跳转" />
+        <button id="dir-go" class="modal-btn">跳转</button>
+      </div>
+      <div class="dir-search-wrap">
+        <input id="dir-search" class="modal-input dir-search" placeholder="过滤当前层文件夹…" />
+      </div>
+      <div id="dir-list" class="dir-list"></div>
+      <div class="modal-actions">
+        <button id="dir-cancel" class="modal-btn">取消</button>
+        <button id="dir-ok" class="modal-btn primary">选择此目录</button>
+      </div>
+    </div>
+  </div>
+
   <div id="project-modal" class="modal hidden">
     <div class="modal-box">
       <h3 id="project-modal-title">新建项目</h3>
@@ -135,6 +155,23 @@
           <span id="project-account-label">请选择账号</span>
         </button>
         <div id="project-account-menu" class="dropdown-menu hidden"></div>
+      </div>
+      <label id="project-remote-toggle" class="restrict-toggle" title="作为远程 SSH 项目（在远端主机上编辑）">
+        <input type="checkbox" id="project-remote-check" />
+        <span class="restrict-track"><span class="restrict-knob"></span></span>
+        <span class="restrict-label">远程 SSH</span>
+      </label>
+      <div id="project-remote-fields" class="hidden">
+        <select id="project-remote-target" class="remote-select">
+          <option value="">— 选择 SSH 主机 / Tailscale 设备 —</option>
+        </select>
+        <input id="project-remote-user" type="text" placeholder="用户名（可留空，用 ssh 默认）" />
+        <input id="project-remote-root" type="text" placeholder="远程根目录，如 /home/u/app" />
+        <button type="button" id="project-remote-browse" class="btn ghost small">浏览远程目录…</button>
+        <div id="project-remote-hint" class="remote-hint"></div>
+        <input id="project-remote-alias" type="hidden" />
+        <input id="project-remote-host" type="hidden" />
+        <input id="project-remote-port" type="hidden" />
       </div>
       <div class="modal-actions">
         <button id="project-modal-cancel" class="btn ghost">取消</button>

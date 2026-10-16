@@ -28,8 +28,8 @@ pub async fn open_ide_window(
         return Ok(());
     }
 
-    // 取项目名、restrict 与工作目录，供 IDE 显示、越界判断与文件监听。
-    let (name, restrict, workdir) = {
+    // 取项目名、restrict、工作目录与远程标识，供 IDE 显示、越界判断与文件监听。
+    let (name, restrict, workdir, remote_label) = {
         let inner = state.inner.lock().await;
         let name = inner
             .projects
@@ -38,18 +38,42 @@ pub async fn open_ide_window(
             .unwrap_or_else(|| project_id.clone());
         let restrict = inner.projects.restrict_of(&project_id);
         let workdir = inner.projects.workdir_of(&project_id);
-        (name, restrict, workdir)
+        let remote = inner.projects.remote_of(&project_id);
+        let label = remote.map(|s| {
+            if let Some(a) = s.ssh_alias.filter(|a| !a.is_empty()) {
+                a
+            } else if let Some(u) = s.user.filter(|u| !u.is_empty()) {
+                format!("{u}@{}", s.host)
+            } else {
+                s.host
+            }
+        });
+        (name, restrict, workdir, label)
     };
 
-    let url = format!(
-        "ide/index.html?project={}&name={}&restrict={}",
-        urlencode(&project_id),
-        urlencode(&name),
-        if restrict { 1 } else { 0 }
-    );
+    let url = match &remote_label {
+        Some(rl) => format!(
+            "ide/index.html?project={}&name={}&restrict={}&remote={}",
+            urlencode(&project_id),
+            urlencode(&name),
+            if restrict { 1 } else { 0 },
+            urlencode(rl)
+        ),
+        None => format!(
+            "ide/index.html?project={}&name={}&restrict={}",
+            urlencode(&project_id),
+            urlencode(&name),
+            if restrict { 1 } else { 0 }
+        ),
+    };
+
+    let title = match &remote_label {
+        Some(rl) => format!("力工 IDE — SSH: {rl}"),
+        None => "力工 IDE".to_string(),
+    };
 
     let win = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
-        .title("力工 IDE")
+        .title(title)
         .inner_size(1180.0, 760.0)
         .min_inner_size(720.0, 480.0)
         .decorations(false)
@@ -58,14 +82,16 @@ pub async fn open_ide_window(
 
     win.set_focus().map_err(|e| e.to_string())?;
 
-    // 注册文件监听（若有工作目录），用于外部改动同步。
-    if let Some(dir) = workdir {
-        let root = std::path::PathBuf::from(dir);
-        if root.is_dir() {
-            let mut guard = state.inner.lock().await;
-            if let Some(w) = guard.ide_watcher.as_mut() {
-                if let Err(e) = w.add(&project_id, &root) {
-                    eprintln!("注册 IDE 文件监听失败: {e}");
+    // 注册文件监听（若有本地工作目录）。远程项目无本地目录，不注册。
+    if remote_label.is_none() {
+        if let Some(dir) = workdir {
+            let root = std::path::PathBuf::from(dir);
+            if root.is_dir() {
+                let mut guard = state.inner.lock().await;
+                if let Some(w) = guard.ide_watcher.as_mut() {
+                    if let Err(e) = w.add(&project_id, &root) {
+                        eprintln!("注册 IDE 文件监听失败: {e}");
+                    }
                 }
             }
         }

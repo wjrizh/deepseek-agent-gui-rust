@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::prompt_gui::{DSML_ERROR_PROMPT, FORMAT_ERROR_PROMPT, TOOLS_SECTION_GUI, system_prompt_with_env};
+use crate::prompt_gui::{DSML_ERROR_PROMPT, FORMAT_ERROR_PROMPT, TOOLS_SECTION_GUI, system_prompt_with_remote};
 use crate::state::{AppState, BRIDGE_IDLE_SECS};
 use deepseek_agent::agent::model::Model;
 use deepseek_agent::agent::parser::{self, ParseOutcome};
@@ -492,12 +492,26 @@ pub async fn run_turn(
             .unwrap_or(false)
     };
 
-    let workdir_now = {
+    let remote_spec = {
+        let inner = state.inner.lock().await;
+        inner.projects.remote_of(&project_id)
+    };
+
+    // 远程项目的工作目录取远端 root；本地项目取 workdir_of。
+    let workdir_now = if let Some(spec) = &remote_spec {
+        spec.root.clone()
+    } else {
         let inner = state.inner.lock().await;
         inner
             .projects
             .workdir_of(&project_id)
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().to_string_lossy().to_string())
+    };
+
+    // 异步探测远端 OS（probe_remote 是同步的，is_win 需提前算好传入）。
+    let is_win_remote = match &remote_spec {
+        Some(spec) => crate::ide::backend::is_windows_remote(spec).await,
+        None => false,
     };
 
     let mut next_prompt = {
@@ -514,7 +528,10 @@ pub async fn run_turn(
         if prompt_already_sent {
             input_full
         } else {
-            format!("{}\n\n{TOOLS_SECTION_GUI}\n\n{input_full}", system_prompt_with_env())
+            format!(
+                "{}\n\n{TOOLS_SECTION_GUI}\n\n{input_full}",
+                system_prompt_with_remote(remote_spec.as_ref(), is_win_remote)
+            )
         }
     };
 
@@ -591,7 +608,7 @@ pub async fn run_turn(
                 }
                 let _ = app.emit("agent://projects-changed", ());
                 let _ = app.emit("agent://handoff", serde_json::json!({ "project_id": project_id, "count": n }));
-                next_prompt = format!("{}\n\n{TOOLS_SECTION_GUI}\n\n{HANDOFF_INTRO}{report}\n===== 交接报告结束 =====\n\n{input}", system_prompt_with_env());
+                next_prompt = format!("{}\n\n{TOOLS_SECTION_GUI}\n\n{HANDOFF_INTRO}{report}\n===== 交接报告结束 =====\n\n{input}", system_prompt_with_remote(remote_spec.as_ref(), is_win_remote));
             }
         }
 
@@ -1151,11 +1168,12 @@ pub(crate) async fn execute_tool(
         call.name.as_str(),
         "execute_command" | "read_file" | "write_file" | "edit_file"
     ) {
-        let (workdir, restrict) = {
+        let (workdir, restrict, remote_spec) = {
             let inner = state.inner.lock().await;
             (
                 inner.projects.workdir_of(project_id),
                 inner.projects.restrict_of(project_id),
+                inner.projects.remote_of(project_id),
             )
         };
         let cwd = workdir
@@ -1163,12 +1181,18 @@ pub(crate) async fn execute_tool(
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
         return match call.name.as_str() {
             "execute_command" => {
-                let runner =
-                    crate::tools::ExecuteCommand::new(cwd.clone()).with_cancel(cancel.clone());
-                runner
-                    .call(&call.params, false, &mut on_output)
-                    .await
-                    .map_err(|e| e.to_string())
+                if let Some(spec) = &remote_spec {
+                    crate::tools::remote::exec_remote(spec, &call.params, &mut on_output)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    let runner =
+                        crate::tools::ExecuteCommand::new(cwd.clone()).with_cancel(cancel.clone());
+                    runner
+                        .call(&call.params, false, &mut on_output)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
             }
             "read_file" => crate::tools::ReadFile::new(cwd)
                 .with_restrict(restrict)

@@ -125,6 +125,8 @@ pub struct Inner {
     pub pending_sub_results: HashMap<String, Vec<SubResult>>,
     /// 唤起主 agent 一轮的间接入口（打破 async 类型递归环）。
     pub start_turn: Option<StartTurnFn>,
+    /// 活跃的远程端口转发（key = 本地端口）。持有 ssh 子进程，drop 时关闭。
+    pub forwards: HashMap<u16, crate::ide::forward::ForwardHandle>,
 }
 
 pub struct AppState {
@@ -159,6 +161,7 @@ impl Default for AppState {
                 account_last_at: HashMap::new(),
                 pending_sub_results: HashMap::new(),
                 start_turn: None,
+                forwards: HashMap::new(),
             })),
             last_request_at: Mutex::new(None),
         }

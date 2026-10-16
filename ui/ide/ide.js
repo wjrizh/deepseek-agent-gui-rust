@@ -11,9 +11,12 @@ import {
   gitBranches, gitBranchCreate, gitCheckout, gitBranchDelete, gitLog, gitShow, gitReset,
   gitInit, gitFetch, gitClone, gitMerge, gitMergeAbort, gitResolve,
   gitStashPush, gitStashList, gitStashOp, gitFileLog, gitBlame,
+  searchContent, uploadPaths, downloadFile,
+  forwardOpen, forwardClose, forwardList,
 } from "./api.js";
-import { initTerminal } from "./term.js";
-import { initBottom, toggleBottom, setProjectId } from "./bottom.js";
+import { initTerminal, newRemoteTerminal } from "./term.js";
+import { initBottom, toggleBottom, setProjectId, setPortsHandlers } from "./bottom.js";
+import { getProjectRemote, setProjectRemote, remoteTerminalArgv } from "./api.js";
 
 // 剪贴板：仅记录一次复制/剪切操作的相对路径，粘贴时读取。
 let clip = null; // { items: [{rel, isDir}], mode: "copy" | "cut" }
@@ -22,6 +25,7 @@ const params = new URLSearchParams(location.search);
 const projectId = params.get("project") || "";
 const projectName = params.get("name") || projectId;
 const restrict = params.get("restrict") === "1";
+const remoteLabel = params.get("remote") || "";
 
 const els = {
   projectName: document.getElementById("project-name"),
@@ -1311,17 +1315,30 @@ function showModal({ title, input, text, okText, danger, defaultValue }) {
 // —— 上一层：切树根并把项目工作目录同步过去，主 UI 顶栏会实时跟随 ——
 async function goUpAndSync() {
   if (restrict) { els.statusPath.textContent = "已开启目录限制，无法浏览上一层"; return; }
-  const before = tree.getRoot();
-  const after = normRelLocal(before + "/..");
-  if (after === before) { els.statusPath.textContent = "已到顶层"; return; }
-  // 先更新工作目录，再切树刷新：确保 refresh 时 listDir 使用新 root，
-  // 这样 entry.rel 才是相对新工作目录的路径（否则会多带一层 ../）。
   try {
+    const spec = remoteLabel ? await getProjectRemote(projectId) : null;
+    if (spec) {
+      const newRoot = remoteParent(spec.root);
+      if (!newRoot || newRoot === spec.root) { els.statusPath.textContent = "已到顶层"; return; }
+      await setProjectRemote(projectId, {
+        host: spec.host, user: spec.user || null, port: spec.port || null,
+        root: newRoot, ssh_alias: spec.ssh_alias || null,
+        proxy_jump: spec.proxy_jump || null, restrict: !!spec.restrict,
+      });
+      projectRootAbs = newRoot;
+      await tree.setRoot("");
+      updateSidebarPath("");
+      els.statusPath.textContent = "工作目录 → " + newRoot;
+      return;
+    }
+    const before = tree.getRoot();
+    const after = normRelLocal(before + "/..");
+    if (after === before) { els.statusPath.textContent = "已到顶层"; return; }
     const cur = await getWorkdir(projectId);
     const abs = newAbsFromRel(cur, before, after);
     await setWorkdir(projectId, abs);
     projectRootAbs = abs;
-    await tree.setRoot(after); // 内部已 refresh，勿重复调用
+    await tree.setRoot(after);
     updateSidebarPath(after);
     els.statusPath.textContent = "工作目录 → " + abs;
   } catch (e) {
@@ -1393,12 +1410,14 @@ function showContextMenu(entry, x, y) {
       menuItem("在此新建文件", () => newEntry(entry.rel, false)),
       menuItem("在此新建文件夹", () => newEntry(entry.rel, true)),
     );
+    if (remoteLabel) m.append(menuItem("上传文件到此处…", () => uploadToDir(entry.rel)));
   } else {
     m.append(
       menuItem("打开", () => openFile(entry.rel, entry.name)),
       menuItem("文件历史", () => showFileHistory(entry.rel)),
       menuItem("查看 Blame", () => showBlame(entry.rel)),
     );
+    if (remoteLabel) m.append(menuItem("下载到本地…", () => downloadTo(entry.rel)));
   }
   m.append(sep());
   const sel = tree.getSelection();
@@ -1488,6 +1507,122 @@ function isTextDoc(rel) {
 function sep() { const d = document.createElement("div"); d.className = "ctx-sep"; return d; }
 function parentOf(rel) { const i = rel.lastIndexOf("/"); return i <0 ? "" : rel.slice(0, i); }
 
+// —— 远程端口转发面板 ——
+let forwardSpec = null; // { host, user, port, sshAlias }
+
+// 打开一个远程 SSH 交互终端（复用后端 ssh::terminal_argv，含 -tt 与远端 cd root）。
+async function openRemoteTerminal() {
+  els.statusPath.textContent = "建立远程终端中…";
+  try {
+    const argv = await remoteTerminalArgv(projectId);
+    newRemoteTerminal(argv.prog, argv.args, "SSH " + (argv.label || ""));
+    els.statusPath.textContent = "远程终端已打开：" + (argv.label || "");
+  } catch (e) {
+    els.statusPath.textContent = "远程终端失败：" + e;
+  }
+}
+
+async function refreshPorts() {
+  const list = document.getElementById("ports-list");
+  if (!list) return;
+  let items = [];
+  try { items = await forwardList(); } catch { items = []; }
+  list.innerHTML = "";
+  if (!items.length) {
+    const empty = document.createElement("div");
+    empty.className = "ports-empty";
+    empty.textContent = "暂无转发。填写本地端口与远端目标后点「转发」。";
+    list.appendChild(empty);
+    return;
+  }
+  for (const f of items) {
+    const row = document.createElement("div");
+    row.className = "ports-row";
+    const label = document.createElement("span");
+    label.className = "ports-row-label";
+    label.textContent = `127.0.0.1:${f.local_port} → ${f.remote_host}:${f.remote_port}`;
+    const open = document.createElement("button");
+    open.className = "term-btn";
+    open.textContent = "打开";
+    open.title = "在浏览器打开 http://127.0.0.1:" + f.local_port;
+    open.addEventListener("click", () => window.open("http://127.0.0.1:" + f.local_port));
+    const del = document.createElement("button");
+    del.className = "term-btn";
+    del.textContent = "✕";
+    del.title = "关闭转发";
+    del.addEventListener("click", async () => {
+      try { await forwardClose(f.local_port); } catch (e) { els.statusPath.textContent = "关闭失败：" + e; }
+      await refreshPorts();
+    });
+    row.append(label, open, del);
+    list.appendChild(row);
+  }
+}
+
+async function addForward() {
+  const localEl = document.getElementById("fwd-local");
+  const hostEl = document.getElementById("fwd-remote-host");
+  const portEl = document.getElementById("fwd-remote-port");
+  const localPort = parseInt(localEl.value, 10);
+  const remoteHost = (hostEl.value || "127.0.0.1").trim();
+  const remotePort = parseInt(portEl.value, 10);
+  if (!localPort || localPort <1 || localPort > 65535) { els.statusPath.textContent = "本地端口无效"; return; }
+  if (!remotePort || remotePort <1 || remotePort > 65535) { els.statusPath.textContent = "远端端口无效"; return; }
+  if (!forwardSpec) { els.statusPath.textContent = "当前项目不是远程项目，无法转发"; return; }
+  els.statusPath.textContent = "建立转发中…";
+  try {
+    await forwardOpen({
+      host: forwardSpec.host,
+      user: forwardSpec.user || null,
+      port: forwardSpec.port || null,
+      sshAlias: forwardSpec.sshAlias || null,
+      localPort,
+      remoteHost,
+      remotePort,
+    });
+    els.statusPath.textContent = `转发已建立：127.0.0.1:${localPort} → ${remoteHost}:${remotePort}`;
+    await refreshPorts();
+  } catch (e) {
+    els.statusPath.textContent = "转发失败：" + e;
+  }
+}
+
+// 远程项目：上传本地文件到远程目录。
+async function uploadToDir(relDir) {
+  let selected;
+  try {
+    selected = await window.__TAURI__.dialog.open({ multiple: true, title: "选择要上传的本地文件" });
+  } catch (e) { els.statusPath.textContent = "打开选择器失败：" + e; return; }
+  if (!selected) return;
+  const paths = Array.isArray(selected) ? selected : [selected];
+  if (!paths.length) return;
+  els.statusPath.textContent = "上传中…";
+  try {
+    const res = await uploadPaths(projectId, paths, relDir);
+    els.statusPath.textContent = `已上传 ${res.uploaded} 个文件` + (res.failed && res.failed.length ? `，失败 ${res.failed.length} 个` : "");
+    await refreshParent(relDir ? relDir + "/x" : "x");
+  } catch (e) {
+    els.statusPath.textContent = "上传失败：" + e;
+  }
+}
+
+// 远程项目：下载远程文件到本地。
+async function downloadTo(rel) {
+  const name = rel.split("/").pop();
+  let dest;
+  try {
+    dest = await window.__TAURI__.dialog.save({ title: "保存到本地", defaultPath: name });
+  } catch (e) { els.statusPath.textContent = "打开保存框失败：" + e; return; }
+  if (!dest) return;
+  els.statusPath.textContent = "下载中…";
+  try {
+    await downloadFile(projectId, rel, dest);
+    els.statusPath.textContent = "已下载到 " + dest;
+  } catch (e) {
+    els.statusPath.textContent = "下载失败：" + e;
+  }
+}
+
 function installContextMenu() {
   // 空白处右键：粘贴到当前根。
   els.treeHost.addEventListener("contextmenu", (e) => {
@@ -1510,6 +1645,20 @@ function installContextMenu() {
 
 async function setAsProjectFolder(rel) {
   try {
+    const spec = remoteLabel ? await getProjectRemote(projectId) : null;
+    if (spec) {
+      const newRoot = remoteJoin(spec.root, rel);
+      await setProjectRemote(projectId, {
+        host: spec.host, user: spec.user || null, port: spec.port || null,
+        root: newRoot, ssh_alias: spec.ssh_alias || null,
+        proxy_jump: spec.proxy_jump || null, restrict: !!spec.restrict,
+      });
+      projectRootAbs = newRoot;
+      await tree.setRoot("");
+      updateSidebarPath("");
+      els.statusPath.textContent = "项目文件夹 → " + newRoot;
+      return;
+    }
     const cur = await getWorkdir(projectId);
     const abs = joinAbs(cur, rel);
     await setWorkdir(projectId, abs);
@@ -1529,6 +1678,38 @@ function joinAbs(curAbs, rel) {
     else parts.push(seg);
   }
   return "/" + parts.join("/");
+}
+
+// —— 远程路径跨平台工具 ——
+function isWinPath(p) {
+  return /^[A-Za-z]:/.test(p || "") || (p || "").includes("\\");
+}
+function remoteJoin(root, rel) {
+  if (!rel) return root || "";
+  if (isWinPath(root)) {
+    const sep = "\\";
+    const base = (root || "").replace(/[\\/]+$/, "");
+    const segs = rel.split("/").filter((s) => s && s !== ".");
+    return base + sep + segs.join(sep);
+  }
+  const base = (root || "").replace(/\/+$/, "");
+  const segs = rel.split("/").filter((s) => s && s !== ".");
+  return (base || "") + "/" + segs.join("/");
+}
+function remoteParent(p) {
+  if (!p) return "";
+  if (isWinPath(p)) {
+    const norm = p.replace(/[\\/]+$/, "");
+    if (/^[A-Za-z]:$/.test(norm)) return norm + "\\";
+    const i = Math.max(norm.lastIndexOf("\\"), norm.lastIndexOf("/"));
+    if (i <= 1) return norm.slice(0, 2) + "\\";
+    const parent = norm.slice(0, i);
+    return /^[A-Za-z]:$/.test(parent) ? parent + "\\" : parent;
+  }
+  const norm = p.replace(/\/+$/, "");
+  if (norm === "" || norm === "/") return "/";
+  const i = norm.lastIndexOf("/");
+  return i <= 0 ? "/" : norm.slice(0, i);
 }
 
 async function newEntry(parentDir, isDir) {
@@ -1660,9 +1841,18 @@ async function pasteInto(destDir) {
 
 async function boot() {
   if (!projectId) { els.statusPath.textContent = "缺少 project 参数"; return; }
-  els.projectName.textContent = projectName;
+  els.projectName.textContent = remoteLabel
+    ? projectName + "  ·  SSH: " + remoteLabel
+    : projectName;
 
-  try { projectRootAbs = await getWorkdir(projectId); } catch { projectRootAbs = ""; }
+  if (remoteLabel) {
+    try {
+      const spec = await getProjectRemote(projectId);
+      projectRootAbs = (spec && spec.root) ? spec.root : "";
+    } catch { projectRootAbs = ""; }
+  } else {
+    try { projectRootAbs = await getWorkdir(projectId); } catch { projectRootAbs = ""; }
+  }
 
   tree = createTree(els.treeHost, projectId, (rel, name) => {
     if (hasUnreadAgentDiff(rel)) {
@@ -1735,11 +1925,20 @@ async function boot() {
   els.redoBtn.onclick = () => doRedo();
   installContextMenu();
 
-  // 搜索：防抖
+  // 搜索：普通=按文件名；以 # 开头=按内容（rg/grep，远程走 ssh）。防抖。
   let searchTimer = null;
   els.searchInput.addEventListener("input", () => {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => tree.search(els.searchInput.value), 180);
+    const raw = els.searchInput.value;
+    const isContent = raw.trimStart().startsWith("#");
+    els.searchInput.placeholder = isContent ? "搜索内容…" : "搜索文件…";
+    searchTimer = setTimeout(() => {
+      if (isContent) {
+        tree.searchContent(raw.trimStart().slice(1));
+      } else {
+        tree.search(raw);
+      }
+    }, 180);
   });
 
   window.addEventListener("keydown", (e) => {
@@ -1790,8 +1989,19 @@ async function boot() {
   installFsWatch();
   installAgentDiffWatch();
   setProjectId(projectId);
-  initTerminal({ projectId, cwdProvider: () => projectRootAbs || "" });
+  initTerminal({
+    projectId,
+    cwdProvider: () => projectRootAbs || "",
+    onRemoteNew: remoteLabel ? openRemoteTerminal : null,
+  });
   initBottom({ projectId, cwdProvider: () => projectRootAbs || "" });
+  setPortsHandlers({ onOpen: refreshPorts, onAdd: addForward });
+  if (remoteLabel) {
+    try {
+      const spec = await getProjectRemote(projectId);
+      if (spec) forwardSpec = { host: spec.host, user: spec.user, port: spec.port, sshAlias: spec.ssh_alias };
+    } catch {}
+  }
   refreshGit();
 }
 

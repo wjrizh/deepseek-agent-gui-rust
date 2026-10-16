@@ -56,6 +56,8 @@ pub async fn term_open(
     id: String,
     cwd: Option<String>,
     shell: Option<String>,
+    prog: Option<String>,
+    args: Option<Vec<String>>,
     cols: u16,
     rows: u16,
     on_event: Channel<TermEvent>,
@@ -71,13 +73,27 @@ pub async fn term_open(
         })
         .map_err(|e| format!("创建 PTY 失败：{e}"))?;
 
-    let shell_path = shell
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(default_shell);
-
-    let mut cmd = CommandBuilder::new(&shell_path);
-    // 交互式登录 shell：与用户在真实终端里敲命令一致。
-    cmd.arg("-i");
+    // 指定 prog 时直接运行该程序（如 ssh/tailscale）；否则跑交互式登录 shell。
+    let mut cmd = match prog.filter(|p| !p.trim().is_empty()) {
+        Some(p) => {
+            let mut c = CommandBuilder::new(&p);
+            if let Some(a) = args.as_ref() {
+                for x in a {
+                    c.arg(x);
+                }
+            }
+            c
+        }
+        None => {
+            let shell_path = shell
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(default_shell);
+            let mut c = CommandBuilder::new(&shell_path);
+            // 交互式登录 shell：与用户在真实终端里敲命令一致。
+            c.arg("-i");
+            c
+        }
+    };
     if let Some(dir) = cwd.filter(|d| !d.trim().is_empty()) {
         if std::path::Path::new(&dir).is_dir() {
             cmd.cwd(dir);

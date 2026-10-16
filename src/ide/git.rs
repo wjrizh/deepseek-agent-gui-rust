@@ -11,6 +11,108 @@ use tauri::State;
 
 use crate::state::AppState;
 
+/// 远程 git 命令超时（push/pull/clone 可能较慢）。
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 统一 git 目标：本地工作目录或远程主机（经 ssh 在远端执行 git）。
+struct GitTarget {
+    local: Option<std::path::PathBuf>,
+    remote: Option<crate::projects::RemoteSpec>,
+    remote_root: String,
+}
+
+/// 以本地/远程统一方式执行 git。用法：run_git!(目标, 参数)。
+macro_rules! run_git {
+    ($t:expr, $a:expr $(,)?) => {
+        $t.git($a).await
+    };
+}
+
+/// 组装 POSIX 远程 git 命令（每个参数单引号转义）。
+fn build_posix_git(root: &str, args: &[&str]) -> String {
+    let q = crate::ide::backend::shell_quote;
+    let mut s = format!("GIT_TERMINAL_PROMPT=0 LC_ALL=C git -C {} ", q(root));
+    for a in args {
+        s.push_str(&q(a));
+        s.push(' ');
+    }
+    s
+}
+
+/// 组装 Windows 远程 git 命令（pwsh，参数单引号字面量）。
+fn build_ps_git(root: &str, args: &[&str]) -> String {
+    let q = crate::ide::backend::ps_lit;
+    let mut s = format!(
+        "$env:GIT_TERMINAL_PROMPT='0'; $env:LC_ALL='C'; & git -C {} ",
+        q(root)
+    );
+    for a in args {
+        s.push_str(&q(a));
+        s.push(' ');
+    }
+    s.push_str("; exit $LASTEXITCODE");
+    s
+}
+
+impl GitTarget {
+    /// 执行一条 git 命令，返回 (成功?, stdout, stderr)。
+    async fn git(&self, args: &[&str]) -> Result<(bool, String, String), String> {
+        if let Some(spec) = &self.remote {
+            let (ok, out, err) = if crate::ide::backend::is_windows_remote(spec).await {
+                let script = build_ps_git(&self.remote_root, args);
+                let o = crate::ide::ssh::exec_ps(spec, &script, GIT_TIMEOUT).await?;
+                (o.ok(), o.stdout, o.stderr)
+            } else {
+                let cmd = build_posix_git(&self.remote_root, args);
+                let o = crate::ide::ssh::exec_timeout(spec, &cmd, GIT_TIMEOUT).await?;
+                (o.ok(), o.stdout, o.stderr)
+            };
+            return Ok((ok, out, err));
+        }
+        let root = self.local.as_ref().expect("本地 git 目标缺少路径");
+        run_git(root, args)
+    }
+
+    /// 是否为 git 仓库。
+    async fn is_repo(&self) -> bool {
+        matches!(
+            self.git(&["rev-parse", "--is-inside-work-tree"]).await,
+            Ok((true, _, _))
+        )
+    }
+
+    /// 本地路径（远程返回 None）。
+    #[allow(dead_code)]
+    fn local_root(&self) -> Option<&std::path::Path> {
+        self.local.as_deref()
+    }
+}
+
+/// 依项目类型构造 git 目标（远程项目走 ssh，本地走原逻辑）。
+async fn git_target(
+    state: &State<'_, AppState>,
+    project_id: &str,
+) -> Result<GitTarget, String> {
+    let remote = {
+        let inner = state.inner.lock().await;
+        inner.projects.remote_of(project_id)
+    };
+    if let Some(spec) = remote {
+        let root = spec.root.clone();
+        return Ok(GitTarget {
+            local: None,
+            remote: Some(spec),
+            remote_root: root,
+        });
+    }
+    let root = project_root(state, project_id).await?;
+    Ok(GitTarget {
+        local: Some(root),
+        remote: None,
+        remote_root: String::new(),
+    })
+}
+
 /// 单个文件的工作区状态。
 #[derive(Debug, Clone, Serialize)]
 pub struct GitFile {
@@ -79,10 +181,7 @@ fn run_git(root: &Path, args: &[&str]) -> Result<(bool, String, String), String>
     ))
 }
 
-/// 是否为 git 仓库。
-fn is_repo(root: &Path) -> bool {
-    matches!(run_git(root, &["rev-parse", "--is-inside-work-tree"]), Ok((true, _, _)))
-}
+
 
 /// 读取仓库状态。
 #[tauri::command]
@@ -90,8 +189,8 @@ pub async fn ide_git_status(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<GitStatus, String> {
-    let root = project_root(&state, &project_id).await?;
-    if !is_repo(&root) {
+    let target = git_target(&state, &project_id).await?;
+    if !target.is_repo().await {
         return Ok(GitStatus {
             is_repo: false,
             branch: String::new(),
@@ -102,13 +201,13 @@ pub async fn ide_git_status(
         });
     }
 
-    let branch = run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
+    let branch = run_git!(&target, &["rev-parse", "--abbrev-ref", "HEAD"])
         .map(|(_, o, _)| o.trim().to_string())
         .unwrap_or_default();
     let branch = if branch == "HEAD" { String::new() } else { branch };
 
-    let upstream = run_git(
-        &root,
+    let upstream = run_git!(
+        &target,
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
     )
     .ok()
@@ -119,8 +218,8 @@ pub async fn ide_git_status(
     let mut ahead = 0i64;
     let mut behind = 0i64;
     if !upstream.is_empty() {
-        if let Ok((true, o, _)) = run_git(
-            &root,
+        if let Ok((true, o, _)) = run_git!(
+            &target,
             &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
         ) {
             let parts: Vec<&str> = o.split_whitespace().collect();
@@ -131,7 +230,7 @@ pub async fn ide_git_status(
         }
     }
 
-    let (_, out, _) = run_git(&root, &["status", "--porcelain=v1", "-z", "-uall"])?;
+    let (_, out, _) = run_git!(&target, &["status", "--porcelain=v1", "-z", "-uall"])?;
     let files = parse_status(&out);
 
     Ok(GitStatus {
@@ -193,8 +292,8 @@ pub async fn ide_git_diff(
     staged: bool,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = project_root(&state, &project_id).await?;
-    if !is_repo(&root) {
+    let target = git_target(&state, &project_id).await?;
+    if !target.is_repo().await {
         return Err("不是 git 仓库".into());
     }
     let mut args = vec!["diff", "--no-color", "--no-ext-diff"];
@@ -203,7 +302,7 @@ pub async fn ide_git_diff(
     }
     args.push("--");
     args.push(&rel_path);
-    let (ok, out, err) = run_git(&root, &args)?;
+    let (ok, out, err) = run_git!(&target, &args)?;
     if !ok {
         return Err(format!("git diff 失败：{}", err.trim()));
     }
@@ -211,15 +310,17 @@ pub async fn ide_git_diff(
         return Ok(out);
     }
     // 未跟踪文件不在 `git diff` 输出中：对空文件做 no-index 对比，展示全部新增行。
-    let tracked = run_git(&root, &["ls-files", "--error-unmatch", "--", &rel_path])
+    let tracked = run_git!(&target, &["ls-files", "--error-unmatch", "--", &rel_path])
         .map(|(ok, _, _)| ok)
         .unwrap_or(false);
     if !tracked && !staged {
-        let full = root.join(&rel_path);
-        let full_str = full.to_string_lossy().to_string();
+        let full_str = match target.local_root() {
+            Some(r) => r.join(&rel_path).to_string_lossy().to_string(),
+            None => rel_path.clone(),
+        };
         // no-index 有差异时退出码为 1，属正常；用 /dev/null 作原侧。
-        let (_, ni_out, _) = run_git(
-            &root,
+        let (_, ni_out, _) = run_git!(
+            &target,
             &["diff", "--no-color", "--no-ext-diff", "--no-index", "/dev/null", &full_str],
         )?;
         return Ok(ni_out);
@@ -234,12 +335,12 @@ pub async fn ide_git_stage(
     rel_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let root = project_root(&state, &project_id).await?;
+    let target = git_target(&state, &project_id).await?;
     let rel = rel_path.unwrap_or_default();
     let (ok, _, err) = if rel.is_empty() {
-        run_git(&root, &["add", "-A"])?
+        run_git!(&target, &["add", "-A"])?
     } else {
-        run_git(&root, &["add", "--", &rel])?
+        run_git!(&target, &["add", "--", &rel])?
     };
     if !ok {
         return Err(format!("git add 失败：{}", err.trim()));
@@ -254,12 +355,12 @@ pub async fn ide_git_unstage(
     rel_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let root = project_root(&state, &project_id).await?;
+    let target = git_target(&state, &project_id).await?;
     let rel = rel_path.unwrap_or_default();
     let (ok, _, err) = if rel.is_empty() {
-        run_git(&root, &["reset", "HEAD", "--", "."])?
+        run_git!(&target, &["reset", "HEAD", "--", "."])?
     } else {
-        run_git(&root, &["reset", "HEAD", "--", &rel])?
+        run_git!(&target, &["reset", "HEAD", "--", &rel])?
     };
     if !ok {
         return Err(format!("git reset 失败：{}", err.trim()));
@@ -274,12 +375,17 @@ pub async fn ide_git_discard(
     rel_path: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let root = project_root(&state, &project_id).await?;
-    let full = root.join(&rel_path);
+    let target = git_target(&state, &project_id).await?;
     // 未跟踪文件：直接删除。
-    let (_, ls, _) = run_git(&root, &["ls-files", "--error-unmatch", "--", &rel_path])
+    let (_, ls, _) = run_git!(&target, &["ls-files", "--error-unmatch", "--", &rel_path])
         .unwrap_or((false, String::new(), String::new()));
     if ls.trim().is_empty() {
+        if let Some(spec) = &target.remote {
+            crate::ide::backend::delete(spec, &rel_path).await?;
+            return Ok(());
+        }
+        let root = target.local_root().expect("本地 git 目标缺少路径");
+        let full = root.join(&rel_path);
         if full.is_dir() {
             std::fs::remove_dir_all(&full).map_err(|e| format!("删除失败：{e}"))?;
         } else if full.exists() {
@@ -287,7 +393,7 @@ pub async fn ide_git_discard(
         }
         return Ok(());
     }
-    let (ok, _, err) = run_git(&root, &["checkout", "HEAD", "--", &rel_path])?;
+    let (ok, _, err) = run_git!(&target, &["checkout", "HEAD", "--", &rel_path])?;
     if !ok {
         return Err(format!("git checkout 失败：{}", err.trim()));
     }
@@ -304,8 +410,8 @@ pub async fn ide_git_commit(
     if message.trim().is_empty() {
         return Err("提交信息不能为空".into());
     }
-    let root = project_root(&state, &project_id).await?;
-    let (ok, out, err) = run_git(&root, &["commit", "-m", &message])?;
+    let target = git_target(&state, &project_id).await?;
+    let (ok, out, err) = run_git!(&target, &["commit", "-m", &message])?;
     if !ok {
         return Err(format!("git commit 失败：{}", err.trim()));
     }
@@ -318,8 +424,8 @@ pub async fn ide_git_push(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = project_root(&state, &project_id).await?;
-    let (ok, out, err) = run_git(&root, &["push"])?;
+    let target = git_target(&state, &project_id).await?;
+    let (ok, out, err) = run_git!(&target, &["push"])?;
     if !ok {
         return Err(format!("git push 失败：{}", err.trim()));
     }
@@ -332,8 +438,8 @@ pub async fn ide_git_pull(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = project_root(&state, &project_id).await?;
-    let (ok, out, err) = run_git(&root, &["pull", "--ff-only"])?;
+    let target = git_target(&state, &project_id).await?;
+    let (ok, out, err) = run_git!(&target, &["pull", "--ff-only"])?;
     if !ok {
         return Err(format!("git pull 失败：{}", err.trim()));
     }
@@ -354,15 +460,15 @@ pub async fn ide_git_branches(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<GitBranch>, String> {
-    let root = project_root(&state, &project_id).await?;
-    if !is_repo(&root) {
+    let target = git_target(&state, &project_id).await?;
+    if !target.is_repo().await {
         return Ok(Vec::new());
     }
-    let cur = run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
+    let cur = run_git!(&target, &["rev-parse", "--abbrev-ref", "HEAD"])
         .map(|(_, o, _)| o.trim().to_string())
         .unwrap_or_default();
-    let (ok, out, err) = run_git(
-        &root,
+    let (ok, out, err) = run_git!(
+        &target,
         &[
             "for-each-ref",
             "--format=%(refname:short)\t%(upstream:short)",
@@ -404,14 +510,14 @@ pub async fn ide_git_branch_create(
     if name.is_empty() {
         return Err("分支名不能为空".into());
     }
-    let root = project_root(&state, &project_id).await?;
+    let target = git_target(&state, &project_id).await?;
     let base = from.unwrap_or_default();
     let args: Vec<&str> = if base.trim().is_empty() {
         vec!["checkout", "-b", name]
     } else {
         vec!["checkout", "-b", name, base.trim()]
     };
-    let (ok, _, err) = run_git(&root, &args)?;
+    let (ok, _, err) = run_git!(&target, &args)?;
     if !ok {
         return Err(format!("创建分支失败：{}", err.trim()));
     }
@@ -425,8 +531,8 @@ pub async fn ide_git_checkout(
     name: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = project_root(&state, &project_id).await?;
-    let (ok, out, err) = run_git(&root, &["checkout", name.trim()])?;
+    let target = git_target(&state, &project_id).await?;
+    let (ok, out, err) = run_git!(&target, &["checkout", name.trim()])?;
     if !ok {
         return Err(format!("切换分支失败：{}", err.trim()));
     }
@@ -441,9 +547,9 @@ pub async fn ide_git_branch_delete(
     force: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let root = project_root(&state, &project_id).await?;
+    let target = git_target(&state, &project_id).await?;
     let flag = if force { "-D" } else { "-d" };
-    let (ok, _, err) = run_git(&root, &["branch", flag, name.trim()])?;
+    let (ok, _, err) = run_git!(&target, &["branch", flag, name.trim()])?;
     if !ok {
         return Err(format!("删除分支失败：{}", err.trim()));
     }
@@ -467,13 +573,13 @@ pub async fn ide_git_log(
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<Vec<GitCommit>, String> {
-    let root = project_root(&state, &project_id).await?;
-    if !is_repo(&root) {
+    let target = git_target(&state, &project_id).await?;
+    if !target.is_repo().await {
         return Ok(Vec::new());
     }
     let n = limit.unwrap_or(100).to_string();
-    let (ok, out, err) = run_git(
-        &root,
+    let (ok, out, err) = run_git!(
+        &target,
         &[
             "log",
             &format!("-n{n}"),
@@ -521,14 +627,14 @@ pub async fn ide_git_show(
     rel_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = project_root(&state, &project_id).await?;
+    let target = git_target(&state, &project_id).await?;
     let rel = rel_path.unwrap_or_default();
     let mut args = vec!["show", "--no-color", "--no-ext-diff", "--format=", hash.as_str()];
     if !rel.is_empty() {
         args.push("--");
         args.push(&rel);
     }
-    let (ok, out, err) = run_git(&root, &args)?;
+    let (ok, out, err) = run_git!(&target, &args)?;
     if !ok {
         return Err(format!("git show 失败：{}", err.trim()));
     }
@@ -543,13 +649,13 @@ pub async fn ide_git_reset(
     mode: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = project_root(&state, &project_id).await?;
+    let target = git_target(&state, &project_id).await?;
     let m = match mode.as_str() {
         "soft" | "mixed" | "hard" => mode.as_str(),
         _ => "mixed",
     };
     let flag = format!("--{m}");
-    let (ok, out, err) = run_git(&root, &["reset", &flag, hash.trim()])?;
+    let (ok, out, err) = run_git!(&target, &["reset", &flag, hash.trim()])?;
     if !ok {
         return Err(format!("git reset 失败：{}", err.trim()));
     }
@@ -562,8 +668,8 @@ pub async fn ide_git_fetch(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = project_root(&state, &project_id).await?;
-    let (ok, out, err) = run_git(&root, &["fetch", "--all", "--prune"])?;
+    let target = git_target(&state, &project_id).await?;
+    let (ok, out, err) = run_git!(&target, &["fetch", "--all", "--prune"])?;
     if !ok {
         return Err(format!("git fetch 失败：{}", err.trim()));
     }
@@ -576,11 +682,11 @@ pub async fn ide_git_init(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = project_root(&state, &project_id).await?;
-    if is_repo(&root) {
+    let target = git_target(&state, &project_id).await?;
+    if target.is_repo().await {
         return Ok("已是 git 仓库".into());
     }
-    let (ok, out, err) = run_git(&root, &["init"])?;
+    let (ok, out, err) = run_git!(&target, &["init"])?;
     if !ok {
         return Err(format!("git init 失败：{}", err.trim()));
     }
@@ -598,25 +704,57 @@ pub async fn ide_git_clone(
     if url.is_empty() {
         return Err("仓库地址不能为空".into());
     }
-    let root = project_root(&state, &project_id).await?;
-    if is_repo(&root) {
+    let target = git_target(&state, &project_id).await?;
+    if target.is_repo().await {
         return Err("当前目录已是 git 仓库".into());
     }
-    let empty = std::fs::read_dir(&root)
-        .map_err(|e| format!("读取目录失败：{e}"))?
-        .next()
-        .is_none();
-    if !empty {
-        return Err("目录非空，无法克隆".into());
+    if let Some(root) = target.local_root() {
+        let empty = std::fs::read_dir(root)
+            .map_err(|e| format!("读取目录失败：{e}"))?
+            .next()
+            .is_none();
+        if !empty {
+            return Err("目录非空，无法克隆".into());
+        }
+        let parent = root.parent().ok_or_else(|| "无效的工作目录".to_string())?;
+        let name = root
+            .file_name()
+            .ok_or_else(|| "无效的工作目录".to_string())?
+            .to_string_lossy()
+            .to_string();
+        std::fs::remove_dir(root).map_err(|e| format!("删除空目录失败：{e}"))?;
+        let (ok, out, err) = run_git(parent, &["clone", url, &name])?;
+        if !ok {
+            return Err(format!("git clone 失败：{}", err.trim()));
+        }
+        return Ok(format!("{}{}", out, err));
     }
-    let parent = root.parent().ok_or_else(|| "无效的工作目录".to_string())?;
-    let name = root
-        .file_name()
-        .ok_or_else(|| "无效的工作目录".to_string())?
-        .to_string_lossy()
-        .to_string();
-    std::fs::remove_dir(&root).map_err(|e| format!("删除空目录失败：{e}"))?;
-    let (ok, out, err) = run_git(parent, &["clone", url, &name])?;
+
+    let spec = target.remote.as_ref().expect("远程 git 目标缺少规格");
+    let root = &target.remote_root;
+    let (ok, out, err) = if crate::ide::backend::is_windows_remote(spec).await {
+        let script = format!(
+            "$r={r}; $p=Split-Path -Parent $r; $n=Split-Path -Leaf $r; \
+             if ((Get-ChildItem -LiteralPath $r -Force | Measure-Object).Count -ne 0) {{ [Console]::Error.Write('目录非空'); exit 3 }}; \
+             Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue; \
+             $env:GIT_TERMINAL_PROMPT='0'; & git -C $p clone {u} $n; exit $LASTEXITCODE",
+            r = crate::ide::backend::ps_lit(root),
+            u = crate::ide::backend::ps_lit(url),
+        );
+        let o = crate::ide::ssh::exec_ps(spec, &script, GIT_TIMEOUT).await?;
+        (o.ok(), o.stdout, o.stderr)
+    } else {
+        let cmd = format!(
+            "r={r}; p=$(dirname \"$r\"); n=$(basename \"$r\"); \
+             if [ -n \"$(ls -A \"$r\" 2>/dev/null)\" ]; then echo 目录非空 >&2; exit 3; fi; \
+             rmdir \"$r\" 2>/dev/null || true; \
+             GIT_TERMINAL_PROMPT=0 git -C \"$p\" clone {u} \"$n\"",
+            r = crate::ide::backend::shell_quote(root),
+            u = crate::ide::backend::shell_quote(url),
+        );
+        let o = crate::ide::ssh::exec_timeout(spec, &cmd, GIT_TIMEOUT).await?;
+        (o.ok(), o.stdout, o.stderr)
+    };
     if !ok {
         return Err(format!("git clone 失败：{}", err.trim()));
     }
@@ -634,8 +772,8 @@ pub async fn ide_git_merge(
     if name.is_empty() {
         return Err("分支名不能为空".into());
     }
-    let root = project_root(&state, &project_id).await?;
-    let (ok, out, err) = run_git(&root, &["merge", "--no-edit", name])?;
+    let target = git_target(&state, &project_id).await?;
+    let (ok, out, err) = run_git!(&target, &["merge", "--no-edit", name])?;
     let text = format!("{}{}", out, err);
     if !ok {
         if text.contains("CONFLICT") || text.contains("Automatic merge failed") {
@@ -652,8 +790,8 @@ pub async fn ide_git_merge_abort(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = project_root(&state, &project_id).await?;
-    let (ok, out, err) = run_git(&root, &["merge", "--abort"])?;
+    let target = git_target(&state, &project_id).await?;
+    let (ok, out, err) = run_git!(&target, &["merge", "--abort"])?;
     if !ok {
         return Err(format!("git merge --abort 失败：{}", err.trim()));
     }
@@ -673,12 +811,12 @@ pub async fn ide_git_resolve(
         "theirs" => "--theirs",
         _ => return Err("side 只能是 ours 或 theirs".into()),
     };
-    let root = project_root(&state, &project_id).await?;
-    let (ok, _, err) = run_git(&root, &["checkout", flag, "--", &rel_path])?;
+    let target = git_target(&state, &project_id).await?;
+    let (ok, _, err) = run_git!(&target, &["checkout", flag, "--", &rel_path])?;
     if !ok {
         return Err(format!("git checkout 冲突侧失败：{}", err.trim()));
     }
-    let (ok, _, err) = run_git(&root, &["add", "--", &rel_path])?;
+    let (ok, _, err) = run_git!(&target, &["add", "--", &rel_path])?;
     if !ok {
         return Err(format!("git add 失败：{}", err.trim()));
     }
@@ -692,14 +830,14 @@ pub async fn ide_git_stash_push(
     message: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let root = project_root(&state, &project_id).await?;
+    let target = git_target(&state, &project_id).await?;
     let msg = message.unwrap_or_default();
     let args: Vec<&str> = if msg.trim().is_empty() {
         vec!["stash", "push", "-u"]
     } else {
         vec!["stash", "push", "-u", "-m", msg.trim()]
     };
-    let (ok, out, err) = run_git(&root, &args)?;
+    let (ok, out, err) = run_git!(&target, &args)?;
     if !ok {
         return Err(format!("git stash 失败：{}", err.trim()));
     }
@@ -720,11 +858,11 @@ pub async fn ide_git_stash_list(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<GitStash>, String> {
-    let root = project_root(&state, &project_id).await?;
-    if !is_repo(&root) {
+    let target = git_target(&state, &project_id).await?;
+    if !target.is_repo().await {
         return Ok(Vec::new());
     }
-    let (ok, out, err) = run_git(&root, &["stash", "list", "--format=%gd\u{1f}%s\u{1e}"])?;
+    let (ok, out, err) = run_git!(&target, &["stash", "list", "--format=%gd\u{1f}%s\u{1e}"])?;
     if !ok {
         return Err(format!("git stash list 失败：{}", err.trim()));
     }
@@ -758,9 +896,9 @@ pub async fn ide_git_stash_op(
         "pop" | "apply" | "drop" => action.as_str(),
         _ => return Err("action 只能是 pop/apply/drop".into()),
     };
-    let root = project_root(&state, &project_id).await?;
+    let target = git_target(&state, &project_id).await?;
     let spec = format!("stash@{{{index}}}");
-    let (ok, out, err) = run_git(&root, &["stash", act, &spec])?;
+    let (ok, out, err) = run_git!(&target, &["stash", act, &spec])?;
     if !ok {
         return Err(format!("git stash {act} 失败：{}", err.trim()));
     }
@@ -775,13 +913,13 @@ pub async fn ide_git_file_log(
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<Vec<GitCommit>, String> {
-    let root = project_root(&state, &project_id).await?;
-    if !is_repo(&root) {
+    let target = git_target(&state, &project_id).await?;
+    if !target.is_repo().await {
         return Ok(Vec::new());
     }
     let n = limit.unwrap_or(100).to_string();
-    let (ok, out, err) = run_git(
-        &root,
+    let (ok, out, err) = run_git!(
+        &target,
         &[
             "log",
             &format!("-n{n}"),
@@ -815,12 +953,12 @@ pub async fn ide_git_blame(
     rel_path: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<GitBlameLine>, String> {
-    let root = project_root(&state, &project_id).await?;
-    if !is_repo(&root) {
+    let target = git_target(&state, &project_id).await?;
+    if !target.is_repo().await {
         return Ok(Vec::new());
     }
-    let (ok, out, err) = run_git(
-        &root,
+    let (ok, out, err) = run_git!(
+        &target,
         &["blame", "--line-porcelain", "--date=format:%Y-%m-%d %H:%M", "--", &rel_path],
     )?;
     if !ok {
@@ -869,7 +1007,7 @@ fn parse_blame(raw: &str) -> Vec<GitBlameLine> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_log, parse_status};
+    use super::{parse_log, parse_status, GitTarget};
 
     #[test]
     fn parses_modified_and_untracked() {
@@ -948,5 +1086,53 @@ mod tests {
         assert_eq!(blame[0].text, "first line");
         assert_eq!(blame[1].line, 2);
         assert_eq!(blame[1].text, "second line");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn remote_git_roundtrip() {
+        use crate::projects::RemoteSpec;
+        let dir = format!("/tmp/ligong-git-test-{}", std::process::id());
+        let spec = RemoteSpec {
+            host: "localhost".into(),
+            user: None,
+            port: None,
+            root: dir.clone(),
+            ssh_alias: Some("localhost".into()),
+            proxy_jump: None,
+            restrict: true,
+        };
+        crate::ide::ssh::exec(&spec, &format!("rm -rf {} && mkdir -p {}", dir, dir))
+            .await
+            .unwrap();
+        let target = GitTarget {
+            local: None,
+            remote: Some(spec.clone()),
+            remote_root: dir.clone(),
+        };
+        assert!(!target.is_repo().await);
+        let (ok, _, err) = target.git(&["init"]).await.unwrap();
+        assert!(ok, "init: {err}");
+        assert!(target.is_repo().await);
+
+        crate::ide::backend::write_file(&spec, "a.txt", "hello\n").await.unwrap();
+        let (ok, _, err) = target.git(&["add", "-A"]).await.unwrap();
+        assert!(ok, "add: {err}");
+        let (ok, _, err) = target
+            .git(&[
+                "-c", "user.name=t", "-c", "user.email=t@t",
+                "commit", "-m", "first",
+            ])
+            .await
+            .unwrap();
+        assert!(ok, "commit: {err}");
+        let (ok, out, _) = target.git(&["log", "-n1", "--pretty=%s"]).await.unwrap();
+        assert!(ok);
+        assert_eq!(out.trim(), "first");
+        let (ok, out, _) = target.git(&["show", "--format=", "HEAD"]).await.unwrap();
+        assert!(ok);
+        assert!(out.contains("hello"));
+
+        crate::ide::ssh::exec(&spec, &format!("rm -rf {}", dir)).await.unwrap();
     }
 }

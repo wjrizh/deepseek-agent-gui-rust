@@ -73,6 +73,12 @@ async fn suppress_paths(state: &State<'_, AppState>, paths: &[std::path::PathBuf
 /// IDE 删除暂存目录名（位于工作目录根，不显示在文件树中）。
 pub const TRASH_DIR: &str = ".ligong-ide-trash";
 
+/// 取该项目对应的远程规格；Some=远程项目，走 backend 分派。
+async fn remote_of(state: &State<'_, AppState>, project_id: &str) -> Option<crate::projects::RemoteSpec> {
+    let inner = state.inner.lock().await;
+    inner.projects.remote_of(project_id)
+}
+
 /// 取得项目工作目录（绝对路径）。不存在则报错。
 async fn project_root(state: &State<'_, AppState>, project_id: &str) -> Result<std::path::PathBuf, String> {
     let inner = state.inner.lock().await;
@@ -99,6 +105,9 @@ pub async fn ide_list_dir(
     rel_path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<DirEntry>, String> {
+    if let Some(spec) = remote_of(&state, &project_id).await {
+        return crate::ide::backend::list_dir(&spec, &rel_path.unwrap_or_default()).await;
+    }
     let root = project_root(&state, &project_id).await?;
     let restrict = project_restrict(&state, &project_id).await;
     let rel = rel_path.unwrap_or_default();
@@ -153,6 +162,9 @@ pub async fn ide_read_file(
     rel_path: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    if let Some(spec) = remote_of(&state, &project_id).await {
+        return crate::ide::backend::read_file(&spec, &rel_path).await;
+    }
     let root = project_root(&state, &project_id).await?;
     let restrict = project_restrict(&state, &project_id).await;
     let file = path::resolve(&root, &rel_path, restrict, false)?;
@@ -184,6 +196,9 @@ pub async fn ide_write_file(
     content: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if let Some(spec) = remote_of(&state, &project_id).await {
+        return crate::ide::backend::write_file(&spec, &rel_path, &content).await;
+    }
     let root = project_root(&state, &project_id).await?;
     let restrict = project_restrict(&state, &project_id).await;
     let file = path::resolve(&root, &rel_path, restrict, true)?;
@@ -208,6 +223,10 @@ pub async fn ide_delete(
     rel_path: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    if let Some(spec) = remote_of(&state, &project_id).await {
+        crate::ide::backend::delete(&spec, &rel_path).await?;
+        return Ok(String::new());
+    }
     let root = project_root(&state, &project_id).await?;
     let restrict = project_restrict(&state, &project_id).await;
     let target = path::resolve(&root, &rel_path, restrict, false)?;
@@ -346,6 +365,23 @@ pub async fn ide_move(
     new_name: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    if let Some(spec) = remote_of(&state, &project_id).await {
+        let base = rel_path.trim_matches('/');
+        let name = match new_name {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => base.rsplit('/').next().unwrap_or("").to_string(),
+        };
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            return Err("名称非法".to_string());
+        }
+        let to_rel = if dest_dir.trim_matches('/').is_empty() {
+            name
+        } else {
+            format!("{}/{}", dest_dir.trim_matches('/'), name)
+        };
+        crate::ide::backend::rename(&spec, &rel_path, &to_rel).await?;
+        return Ok(to_rel);
+    }
     let root = project_root(&state, &project_id).await?;
     let restrict = project_restrict(&state, &project_id).await;
     let src = path::resolve(&root, &rel_path, restrict, false)?;
@@ -391,6 +427,22 @@ pub async fn ide_create(
     is_dir: bool,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    if let Some(spec) = remote_of(&state, &project_id).await {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("名称不能为空".to_string());
+        }
+        if trimmed.contains('/') || trimmed.contains('\\') {
+            return Err("名称不能包含路径分隔符".to_string());
+        }
+        let rel = if parent_dir.trim_matches('/').is_empty() {
+            trimmed.to_string()
+        } else {
+            format!("{}/{}", parent_dir.trim_matches('/'), trimmed)
+        };
+        crate::ide::backend::create(&spec, &rel, is_dir).await?;
+        return Ok(rel);
+    }
     let root = project_root(&state, &project_id).await?;
     let restrict = project_restrict(&state, &project_id).await;
     let parent = path::resolve(&root, &parent_dir, restrict, true)?;

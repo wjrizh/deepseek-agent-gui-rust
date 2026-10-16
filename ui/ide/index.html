@@ -132,6 +132,7 @@
         <div class="bottom-tabs">
           <button id="bottom-tab-term" class="bottom-tab active">终端</button>
           <button id="bottom-tab-agent" class="bottom-tab">对话</button>
+          <button id="bottom-tab-ports" class="bottom-tab">端口</button>
           <div class="bottom-actions">
             <button id="bottom-close" class="term-btn" title="隐藏面板">✕</button>
           </div>
@@ -141,6 +142,7 @@
           <div class="term-head">
             <div id="term-tabs" class="term-tabs"></div>
             <div class="term-actions">
+              <button id="term-remote" class="term-btn" title="新建远程终端 (SSH)" style="display:none">⇄</button>
               <button id="term-new" class="term-btn" title="新建终端">＋</button>
             </div>
           </div>
@@ -155,6 +157,16 @@
             <button id="agent-stop" class="agent-btn danger hidden" title="停止">停止</button>
             <span id="agent-status" class="agent-status"></span>
           </div>
+        </div>
+
+        <div id="ports-panel" class="ports-panel hidden">
+          <div class="ports-form">
+            <input id="fwd-local" class="ports-input" placeholder="本地端口" />
+            <input id="fwd-remote-host" class="ports-input" placeholder="远端主机" />
+            <input id="fwd-remote-port" class="ports-input" placeholder="远端端口" />
+            <button id="fwd-add" class="term-btn">转发</button>
+          </div>
+          <div id="ports-list" class="ports-list"></div>
         </div>
       </div>
       <div id="statusbar" class="statusbar">

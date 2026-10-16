@@ -4,19 +4,31 @@
 import { ensureTerminal, fitTerminal } from "./term.js";
 import { initAgent, isAgentReady } from "./agent/index.js";
 
-let panel, tabTerm, tabAgent, termPane, agentPane;
-let current = "term"; // "term" | "agent"
+let panel, tabTerm, tabAgent, tabPorts, termPane, agentPane, portsPane;
+let current = "term"; // "term" | "agent" | "ports"
 let getCwd = () => "";
 let onBusy = null;
 let initialized = false;
+let onPortsOpen = null;
+let onForwardAdd = null;
+
+export function setPortsHandlers({ onOpen, onAdd }) {
+  onPortsOpen = onOpen || null;
+  onForwardAdd = onAdd || null;
+}
 
 function applyTab() {
   const isTerm = current === "term";
+  const isAgent = current === "agent";
+  const isPorts = current === "ports";
   tabTerm?.classList.toggle("active", isTerm);
-  tabAgent?.classList.toggle("active", !isTerm);
+  tabAgent?.classList.toggle("active", isAgent);
+  tabPorts?.classList.toggle("active", isPorts);
   termPane?.classList.toggle("hidden", !isTerm);
-  agentPane?.classList.toggle("hidden", isTerm);
+  agentPane?.classList.toggle("hidden", !isAgent);
+  portsPane?.classList.toggle("hidden", !isPorts);
   if (isTerm) fitTerminal();
+  if (isPorts && onPortsOpen) onPortsOpen();
 }
 
 export function isBottomVisible() {
@@ -47,13 +59,19 @@ export function initBottom({ projectId, cwdProvider }) {
   if (!panel) return;
   tabTerm = document.getElementById("bottom-tab-term");
   tabAgent = document.getElementById("bottom-tab-agent");
+  tabPorts = document.getElementById("bottom-tab-ports");
   termPane = document.getElementById("terminal-panel");
   agentPane = document.getElementById("agent-panel");
+  portsPane = document.getElementById("ports-panel");
   getCwd = cwdProvider || (() => "");
 
   tabTerm?.addEventListener("click", () => showBottom("term"));
   tabAgent?.addEventListener("click", () => showBottom("agent"));
+  tabPorts?.addEventListener("click", () => showBottom("ports"));
   document.getElementById("bottom-close")?.addEventListener("click", hideBottom);
+  document.getElementById("fwd-add")?.addEventListener("click", () => {
+    if (onForwardAdd) onForwardAdd();
+  });
 
   onBusy = (busy) => {
     const dot = document.querySelector(".title-dot");

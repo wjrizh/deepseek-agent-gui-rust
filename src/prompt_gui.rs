@@ -29,7 +29,7 @@ Output:
 - 所有思考过程和输出文本必须使用中文。
 - 工具调用必须严格遵守工具说明中的格式；不要自行改写、装饰、缩写或创造标签名称。
 
-Sudo: 需要提权时直接执行，系统会自动以最高权限运行。"#;
+Sudo: 命令默认以当前用户执行（文件属主与 write_file/edit_file 一致）；需要 root 权限的命令，请在命令前显式加 sudo。"#;
 
 /// 工具使用说明（首轮拼接在 `SYSTEM_PROMPT_GUI` 之后）。
 pub const TOOLS_SECTION_GUI: &str = r#"# Tools - MANDATORY FORMAT
@@ -83,7 +83,7 @@ Multiple tool calls:
 They run strictly in order, one at a time. After a tool call, STOP and wait for the corresponding tool results. Never invent tool results.
 
 Tools:
-- execute_command: run a shell command in the project working directory. The shell is chosen by platform and reported in the environment section below (Windows: PowerShell when available, else cmd /C; Unix: sh -c). Always use the syntax of the shell actually reported. The command runs with highest privileges automatically (Windows triggers one UAC prompt; Unix uses sudo when available). Do not run long-blocking or interactive commands.
+- execute_command: run a shell command in the project working directory. The shell is chosen by platform and reported in the environment section below (Windows: PowerShell when available, else cmd /C; Unix: sh -c). Always use the syntax of the shell actually reported. It runs as the current user by default; prefix with sudo yourself when root is required. Do not run long-blocking or interactive commands.
   <parameter name="command">SHELL COMMAND</parameter>
   Prefer read-only (ls/cat/grep/find) before mutating. Multi-line scripts and heredocs are supported.
 - upload_file: upload files for the model to read.
@@ -188,6 +188,18 @@ pub const DSML_ERROR_PROMPT: &str = r#"指令错误。
 
 pub fn system_prompt_with_env() -> String {
     let env = crate::env_probe::probe();
+    format!("{SYSTEM_PROMPT_GUI}\n\n{env}")
+}
+
+/// 生成带远程环境信息的系统提示词。
+///
+/// `remote` 为 None 时等价于 `system_prompt_with_env`（本机）；
+/// `is_win` 需由调用方异步探测 `is_windows_remote` 后传入。
+pub fn system_prompt_with_remote(
+    remote: Option<&crate::projects::RemoteSpec>,
+    is_win: bool,
+) -> String {
+    let env = crate::env_probe::probe_remote(remote, is_win);
     format!("{SYSTEM_PROMPT_GUI}\n\n{env}")
 }
 

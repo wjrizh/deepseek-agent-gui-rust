@@ -10,6 +10,7 @@
 pub mod read_file;
 pub mod write_file;
 pub mod edit_file;
+pub mod remote;
 
 pub use read_file::ReadFile;
 pub use write_file::WriteFile;

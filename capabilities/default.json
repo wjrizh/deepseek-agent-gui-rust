@@ -12,6 +12,7 @@
     "core:event:allow-unlisten",
     "dialog:allow-open",
     "dialog:allow-confirm",
+    "dialog:allow-save",
     "core:window:allow-close",
     "core:window:allow-destroy",
     "core:window:allow-minimize",
