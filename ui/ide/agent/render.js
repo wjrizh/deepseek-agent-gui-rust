@@ -180,7 +180,6 @@ function subAgentCard(s, handlers) {
   card.append(head);
 
   const body = el("div", "ag-sub-body");
-  if (s.duty) body.append(el("div", "ag-sub-duty", s.duty));
   for (const t of s.tools) body.append(toolCard(t));
   const text = (s.lines.join("") + (s.text ? "\n" + s.text : "")).trim();
   if (text) body.append(el("pre", "ag-sub-out", text));

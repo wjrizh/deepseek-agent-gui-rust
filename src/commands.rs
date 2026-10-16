@@ -468,7 +468,6 @@ fn collect_sub_runs(inner: &crate::state::Inner, project_id: &str) -> Vec<serde_
             "project_id": r.project_id,
             "sub_id": r.sid,
             "name": r.name,
-            "duty": r.duty,
             "agent_type": r.agent_type,
             "account": r.account,
             "status": status,
@@ -820,7 +819,6 @@ async fn dispatch_sub_agent(
     state: State<'_, AppState>,
     project_id: String,
     name: String,
-    duty: String,
     task: String,
     agent_type: String,
 ) -> Result<(), String> {
@@ -845,7 +843,6 @@ async fn dispatch_sub_agent(
     let spec = crate::subagent::SubAgentSpec {
         project_id,
         name,
-        duty,
         task,
         agent_type,
     };
@@ -863,7 +860,7 @@ pub async fn retry_sub_agent(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (name, duty, agent_type, last_task) = {
+    let (name, agent_type, last_task) = {
         let inner = state.inner.lock().await;
         let sa = sub_agent_of(&inner, &project_id, &sub_id)?;
         let last_task = inner
@@ -874,7 +871,6 @@ pub async fn retry_sub_agent(
             .ok_or("该子 agent 无可重试的任务记录")?;
         (
             sa.name,
-            sa.duty,
             inner
                 .sub_runs
                 .get(&sub_id)
@@ -883,7 +879,7 @@ pub async fn retry_sub_agent(
             last_task,
         )
     };
-    dispatch_sub_agent(app, state, project_id, name, duty, last_task, agent_type).await
+    dispatch_sub_agent(app, state, project_id, name, last_task, agent_type).await
 }
 
 /// 继续：在现有会话上用新任务续跑。
@@ -898,12 +894,11 @@ pub async fn continue_sub_agent(
     if task.trim().is_empty() {
         return Err("继续任务的内容不能为空".into());
     }
-    let (name, duty, agent_type) = {
+    let (name, agent_type) = {
         let inner = state.inner.lock().await;
         let sa = sub_agent_of(&inner, &project_id, &sub_id)?;
         (
             sa.name,
-            sa.duty,
             inner
                 .sub_runs
                 .get(&sub_id)
@@ -911,7 +906,7 @@ pub async fn continue_sub_agent(
                 .unwrap_or_else(|| "general".to_string()),
         )
     };
-    dispatch_sub_agent(app, state, project_id, name, duty, task, agent_type).await
+    dispatch_sub_agent(app, state, project_id, name, task, agent_type).await
 }
 
 /// 新会话重试：清空当前 active 会话后，用原任务重新派发。
@@ -922,7 +917,7 @@ pub async fn retry_sub_agent_new_conv(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (name, duty, agent_type, last_task) = {
+    let (name, agent_type, last_task) = {
         let mut inner = state.inner.lock().await;
         let sa = sub_agent_of(&inner, &project_id, &sub_id)?;
         let last_task = inner
@@ -942,7 +937,6 @@ pub async fn retry_sub_agent_new_conv(
         let _ = inner.projects.save();
         (
             sa.name,
-            sa.duty,
             inner
                 .sub_runs
                 .get(&sub_id)
@@ -951,7 +945,7 @@ pub async fn retry_sub_agent_new_conv(
             last_task,
         )
     };
-    dispatch_sub_agent(app, state, project_id, name, duty, last_task, agent_type).await
+    dispatch_sub_agent(app, state, project_id, name, last_task, agent_type).await
 }
 
 #[tauri::command]

@@ -26,7 +26,6 @@ pub struct SubLoopCtx {
     pub project_id: String,
     pub sub_id: String,
     pub sub_name: String,
-    pub sub_duty: String,
     pub account: String,
     pub model: Arc<dyn Model>,
     pub session_id: String,
@@ -149,7 +148,7 @@ pub async fn agent_loop(ctx: SubLoopCtx) -> LoopOutcome {
                 // 空 session（网页内核）不持久化；首轮回复拿到真实 UUID 后再补建子会话。
                 let _ = ctx.app.emit("agent://sub-handoff", serde_json::json!({
                     "project_id": project_id, "sub_id": sub_id, "sub_name": ctx.sub_name,
-                    "name": ctx.sub_name, "duty": ctx.sub_duty, "count": n,
+                    "name": ctx.sub_name, "count": n,
                     "run_generation": ctx.run_generation
                 }));
                 session_id = new_sid;
@@ -311,7 +310,7 @@ pub async fn agent_loop(ctx: SubLoopCtx) -> LoopOutcome {
             ParseOutcome::Malformed { raw, reason } => {
                 let _ = ctx.app.emit("agent://sub-format-error", serde_json::json!({
                     "project_id": project_id, "sub_id": sub_id, "reason": reason,
-                    "name": ctx.sub_name, "duty": ctx.sub_duty,
+                    "name": ctx.sub_name,
                     "attempt": format_attempts + 1, "run_generation": ctx.run_generation
                 }));
                 format_attempts += 1;
@@ -328,7 +327,7 @@ pub async fn agent_loop(ctx: SubLoopCtx) -> LoopOutcome {
             ParseOutcome::DsmlMalformed { raw, reason, marker_count } => {
                 let _ = ctx.app.emit("agent://sub-format-error", serde_json::json!({
                     "project_id": project_id, "sub_id": sub_id, "reason": reason,
-                    "name": ctx.sub_name, "duty": ctx.sub_duty,
+                    "name": ctx.sub_name,
                     "marker_count": marker_count, "attempt": format_attempts + 1,
                     "run_generation": ctx.run_generation
                 }));
@@ -352,7 +351,6 @@ pub async fn agent_loop(ctx: SubLoopCtx) -> LoopOutcome {
 pub struct SubAgentSpec {
     pub project_id: String,
     pub name: String,
-    pub duty: String,
     pub task: String,
     pub agent_type: String,
 }
@@ -426,6 +424,92 @@ async fn inject_sub_result(
         );
         let _ = f(app, project_id, block).await;
     }
+}
+
+/// 子 agent 终态后的统一收尾（成功/失败/取消路径共用）：
+/// 延时 3s 后，若仍为本次运行实例且已终态，则移除 sub_run、释放 bridge、
+/// emit sub-closed，并刷新项目 busy 状态。
+fn spawn_sub_finalize(
+    app: AppHandle,
+    state: &crate::state::AppState,
+    account: String,
+    sub_id: String,
+    run_generation: u64,
+) {
+    let inner_arc = state.inner.clone();
+    let app_w = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let should_close = {
+            let inner = inner_arc.lock().await;
+            inner
+                .sub_runs
+                .get(&sub_id)
+                .map(|r| {
+                    r.run_generation == run_generation
+                        && matches!(
+                            r.status,
+                            SubRunStatus::Succeeded
+                                | SubRunStatus::Failed
+                                | SubRunStatus::Cancelled
+                                | SubRunStatus::Closed
+                        )
+                })
+                .unwrap_or(false)
+        };
+        if !should_close {
+            return;
+        }
+        let (pid, nm) = {
+            let mut inner = inner_arc.lock().await;
+            let info = inner
+                .sub_runs
+                .get(&sub_id)
+                .filter(|r| r.run_generation == run_generation)
+                .map(|r| (r.project_id.clone(), r.name.clone()));
+            match info {
+                Some(i) => {
+                    inner.sub_runs.remove(&sub_id);
+                    i
+                }
+                None => return,
+            }
+        };
+        let st = app_w.state::<crate::state::AppState>();
+        st.release_sub_bridge(&account, &sub_id).await;
+        {
+            let inner_for_idle = inner_arc.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(crate::state::BRIDGE_IDLE_SECS + 5)).await;
+                let _ = crate::state::AppState::close_idle(
+                    &inner_for_idle,
+                    Duration::from_secs(crate::state::BRIDGE_IDLE_SECS),
+                )
+                .await;
+            });
+        }
+        let _ = app_w.emit("agent://sub-closed", serde_json::json!({
+            "project_id": pid, "sub_id": sub_id, "name": nm,
+            "run_generation": run_generation,
+        }));
+        let busy = {
+            let mut inner = inner_arc.lock().await;
+            let has_running_sub = inner.sub_runs.values().any(|r| {
+                r.project_id == pid
+                    && matches!(r.status, SubRunStatus::Running | SubRunStatus::Starting)
+            });
+            match inner.running.get_mut(&pid) {
+                Some(ctx) => {
+                    if !ctx.turn_active {
+                        ctx.busy = has_running_sub;
+                    }
+                    ctx.busy
+                }
+                None => false,
+            }
+        };
+        let _ = app_w.emit("agent://project-busy", serde_json::json!({ "id": pid, "busy": busy }));
+    });
 }
 
 pub async fn run_subagent(
@@ -516,7 +600,7 @@ pub async fn run_subagent(
 
         let sid = inner
             .projects
-            .add_sub_agent(&spec.project_id, &spec.name, &spec.duty, &account)
+            .add_sub_agent(&spec.project_id, &spec.name, &account)
             .ok_or("创建子 agent 失败")?;
         let _ = inner.projects.save();
         (sid, account)
@@ -577,7 +661,6 @@ pub async fn run_subagent(
         inner.sub_runs.insert(sub_id.clone(), SubRunCtx {
             sid: sub_id.clone(),
             name: spec.name.clone(),
-            duty: spec.duty.clone(),
             project_id: spec.project_id.clone(),
             account: account.clone(),
             agent_type: spec.agent_type.clone(),
@@ -594,7 +677,7 @@ pub async fn run_subagent(
         gen
     };
     let _ = app.emit("agent://sub-start", serde_json::json!({
-        "project_id": spec.project_id, "sub_id": sub_id, "name": spec.name, "duty": spec.duty,
+        "project_id": spec.project_id, "sub_id": sub_id, "name": spec.name,
         "run_generation": run_generation
     }));
 
@@ -603,7 +686,6 @@ pub async fn run_subagent(
         project_id: spec.project_id.clone(),
         sub_id: sub_id.clone(),
         sub_name: spec.name.clone(),
-        sub_duty: spec.duty.clone(),
         account: account.clone(),
         model,
         session_id,
@@ -673,6 +755,7 @@ pub async fn run_subagent(
             // 格式失败时把最后一次原始回复摘要带出，便于诊断/重试。
             "result": if is_format_failed { outcome.text.clone() } else { String::new() }
         }));
+        spawn_sub_finalize(app.clone(), &state, account.clone(), sub_id.clone(), run_generation);
         return Ok(outcome);
     }
 
@@ -694,68 +777,7 @@ pub async fn run_subagent(
 
     inject_sub_result(app.clone(), &state, spec.project_id.clone(), spec.name.clone(), outcome.ok, &outcome.text).await;
 
-    {
-        let inner_arc = state.inner.clone();
-        let acc = account.clone();
-        let pid_profile = sub_id.clone();
-        let sid = sub_id.clone();
-        let app_w = app.clone();
-        let my_gen = run_generation;
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            // 仅当仍是本次运行实例（generation 匹配）且已终态时才清理，防止同名重启后误删。
-            let should_close = {
-                let inner = inner_arc.lock().await;
-                inner.sub_runs.get(&sid)
-                    .map(|r| r.run_generation == my_gen
-                        && matches!(r.status,
-                            SubRunStatus::Succeeded | SubRunStatus::Failed
-                            | SubRunStatus::Cancelled | SubRunStatus::Closed))
-                    .unwrap_or(false)
-            };
-            if should_close {
-                let (pid, nm, nd) = {
-                    let mut inner = inner_arc.lock().await;
-                    // 再次校验 generation：锁内 CAS，若已被新运行替换则不删。
-                    let info = inner.sub_runs.get(&sid)
-                        .filter(|r| r.run_generation == my_gen)
-                        .map(|r| (r.project_id.clone(), r.name.clone(), r.duty.clone()));
-                    let info = match info {
-                        Some(i) => { inner.sub_runs.remove(&sid); i }
-                        None => return,
-                    };
-                    info
-                };
-                let st = app_w.state::<crate::state::AppState>();
-                st.release_sub_bridge(&acc, &pid_profile).await;
-                // 调度一次 idle worker：子 bridge 在 TTL 后被统一回收（支持短时重派复用）。
-                {
-                    let inner_for_idle = inner_arc.clone();
-                    tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(crate::state::BRIDGE_IDLE_SECS + 5)).await;
-                        let _ = crate::state::AppState::close_idle(
-                            &inner_for_idle,
-                            Duration::from_secs(crate::state::BRIDGE_IDLE_SECS),
-                        ).await;
-                    });
-                }
-                let _ = app_w.emit("agent://sub-closed", serde_json::json!({
-                    "project_id": pid, "sub_id": sid, "name": nm, "duty": nd,
-                    "run_generation": my_gen,
-                }));
-                {
-                    let mut inner = inner_arc.lock().await;
-                    let has_running_sub = inner.sub_runs.values().any(|r| {
-                        r.project_id == pid
-                            && matches!(r.status, SubRunStatus::Running | SubRunStatus::Starting)
-                    });
-                    if let Some(ctx) = inner.running.get_mut(&pid) {
-                        if !ctx.turn_active { ctx.busy = has_running_sub; }
-                    }
-                }
-            }
-        });
-    }
+    spawn_sub_finalize(app.clone(), &state, account.clone(), sub_id.clone(), run_generation);
 
     Ok(outcome)
 }

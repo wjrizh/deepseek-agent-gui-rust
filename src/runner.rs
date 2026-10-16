@@ -638,7 +638,12 @@ pub async fn run_turn(
                         parts.push(format!("{}（{}）", sa.name, st));
                     }
                     (
-                        format!("\n[系统] 本项目子agent：共 {}（运行 {}）—— {}\n", subs.len(), running, parts.join("、")),
+                        format!(
+                            "\n[系统] 本项目子agent（同名再次派发=续跑其对话；有空闲的优先复用，不要为一句话小事新建）：共 {}（运行 {}）—— {}\n",
+                            subs.len(),
+                            running,
+                            parts.join("、")
+                        ),
                         running,
                     )
                 }
@@ -1239,7 +1244,6 @@ async fn run_sub_agent_tool(
             if task.trim().is_empty() {
                 return Err("sub_agent: 缺少 task".into());
             }
-            let duty = call.params.get("duty").cloned().unwrap_or_else(|| name.clone());
             let agent_type = call.params.get("agent_type").cloned().unwrap_or_else(|| "general".into());
 
             {
@@ -1257,7 +1261,6 @@ async fn run_sub_agent_tool(
             let spec = crate::subagent::SubAgentSpec {
                 project_id: project_id.to_string(),
                 name: name.clone(),
-                duty,
                 task,
                 agent_type: agent_type.clone(),
             };

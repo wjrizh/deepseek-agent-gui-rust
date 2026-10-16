@@ -858,7 +858,6 @@ body {
   background: #2a2a2a; border-radius: 6px;
 }
 .sub-name { font-weight: 600; color: #dcdcaa; }
-.sub-duty { color: #888; font-size: 11px; margin-right: auto; }
 .sub-del { background: none; border: none; color: #888; cursor: pointer; padding: 2px; }
 .sub-del:hover { color: #f14c4c; }
 .sub-conv { padding-left: 24px; }

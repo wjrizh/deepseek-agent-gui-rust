@@ -94,26 +94,26 @@ export function createStore(projectId) {
       this.emitChange();
     },
 
-    subStart(id, name, duty, gen) {
+    subStart(id, name, gen) {
       if (!id) return;
       let s = this.subAgents.get(id);
       const g = (typeof gen === "number") ? gen : 0;
       if (s && typeof s.gen === "number" && g <s.gen) return; // 旧实例迟到事件
-      if (!s) { s = { id, name: name || id, duty: duty || "", status: "running", ok: null, reason: null, text: "", lines: [], tools: [], gen: g }; this.subAgents.set(id, s); }
-      s.name = name || s.name; s.duty = duty || s.duty; s.status = "running"; s.gen = g;
+      if (!s) { s = { id, name: name || id, status: "running", ok: null, reason: null, text: "", lines: [], tools: [], gen: g }; this.subAgents.set(id, s); }
+      s.name = name || s.name; s.status = "running"; s.gen = g;
       this.emitChange();
     },
     subDelta(id, name, text) {
       if (!id) return;
       let s = this.subAgents.get(id);
-      if (!s) { s = { id, name: name || id, duty: "", status: "running", ok: null, reason: null, text: "", lines: [], tools: [] }; this.subAgents.set(id, s); }
+      if (!s) { s = { id, name: name || id, status: "running", ok: null, reason: null, text: "", lines: [], tools: [] }; this.subAgents.set(id, s); }
       s.lines.push(text || "");
       this.emitChange();
     },
     subTool(id, name, phase, callId, command, output, ms, error) {
       if (!id) return;
       let s = this.subAgents.get(id);
-      if (!s) { s = { id, name: name || id, duty: "", status: "running", ok: null, reason: null, text: "", lines: [], tools: [] }; this.subAgents.set(id, s); }
+      if (!s) { s = { id, name: name || id, status: "running", ok: null, reason: null, text: "", lines: [], tools: [] }; this.subAgents.set(id, s); }
       const key = id + ":" + callId;
       if (phase === "call") {
         const card = { role: "tool", name: name || "tool", command: command || "", output: "", done: false, error: false };
@@ -133,7 +133,7 @@ export function createStore(projectId) {
       let s = this.subAgents.get(id);
       const g = (typeof gen === "number") ? gen : 0;
       if (s && typeof s.gen === "number" && g <s.gen) return; // 旧实例迟到事件
-      if (!s) { s = { id, name: name || id, duty: "", status: "done", ok: null, reason: null, text: "", lines: [], tools: [], gen: g }; this.subAgents.set(id, s); }
+      if (!s) { s = { id, name: name || id, status: "done", ok: null, reason: null, text: "", lines: [], tools: [], gen: g }; this.subAgents.set(id, s); }
       s.status = ok ? "done" : (reason === "cancelled" ? "cancelled" : "failed");
       s.ok = !!ok; s.reason = reason || null; s.text = result || ""; s.gen = g;
       this.emitChange();
@@ -156,8 +156,8 @@ export function createStore(projectId) {
           : r.status === "failed" ? "failed"
           : r.status === "cancelled" ? "cancelled"
           : "running";
-        const s = cur || { id: r.sub_id, name: r.name || r.sub_id, duty: r.duty || "", ok: null, reason: null, text: "", lines: [], tools: [] };
-        s.name = r.name || s.name; s.duty = r.duty || s.duty; s.status = status; s.gen = g;
+        const s = cur || { id: r.sub_id, name: r.name || r.sub_id, ok: null, reason: null, text: "", lines: [], tools: [] };
+        s.name = r.name || s.name; s.status = status; s.gen = g;
         this.subAgents.set(r.sub_id, s);
       }
       this.emitChange();

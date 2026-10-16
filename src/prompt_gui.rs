@@ -89,11 +89,13 @@ Tools:
 - upload_file: upload files for the model to read.
   <parameter name="paths">/a.png,/b.pdf</parameter> (comma/newline separated; ≤50 files, each ≤100MB).
 - sub_agent: 派一个专职子 agent 去执行附属任务。子 agent 有独立上下文与浏览器能力。
-  <parameter name="name">子agent名字（体现职责，如"网页资料检索"）</parameter>
+  <parameter name="name">子agent名字：简短、宽泛的职责名，如"网页资料检索"、"代码审查"</parameter>
   <parameter name="task">交给它的子任务</parameter>
-  <parameter name="duty">职责说明</parameter>  (可选)
   <parameter name="agent_type">general|explore|code|research|browser</parameter>  (可选)
-  规则：一主三子（同时最多 3 个运行）；同名子 agent 空闲时再次调用=继续它上次的对话；子 agent 只读，需要写操作时它会在结论里"申请写操作"，由你执行。
+  规则：一主三子（同时最多 3 个运行）；子 agent 只读，需要写操作时它会在结论里"申请写操作"，由你执行。
+  复用优先：把任务按"职责域"划分（如 网页资料检索 / 代码审查 / 执行），一个域一个子 agent，名字用域名词。
+  派发前先看本轮注入的"本项目子agent"清单：已有同域 → 用【同名 + 新 task】复用（同名=续跑其对话）；仅确属新域才新建名字。
+  严禁为一句话小事、单个小步骤新建子 agent。
 - read_file: read a file contents with line numbers. Content flows through the tool argument, never through the shell, so $, backticks, quotes and <tag> are safe.
   <parameter name="file_path">/abs/path</parameter>
   <parameter name="offset">1</parameter>  (optional, 1-based start line)

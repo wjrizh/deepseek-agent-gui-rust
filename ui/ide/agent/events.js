@@ -52,11 +52,11 @@ export function installAgentEvents(store, onBusy) {
   });
 
 
-  on("agent://sub-start", (p) => { if (p.project_id === pid) store.subStart(p.sub_id, p.name, p.duty, p.run_generation); });
+  on("agent://sub-start", (p) => { if (p.project_id === pid) store.subStart(p.sub_id, p.name, p.run_generation); });
   on("agent://sub-done", (p) => { if (p.project_id === pid) store.subDone(p.sub_id, p.name, p.ok, p.reason, p.result, p.run_generation); });
   on("agent://sub-closed", (p) => { if (p.project_id === pid) store.subClose(p.sub_id, p.name, p.run_generation); });
   on("agent://sub-format-error", (p) => { if (p.project_id === pid) store.subDone(p.sub_id, p.sub_name || p.name, false, "format", "", p.run_generation); });
-  on("agent://sub-handoff", (p) => { if (p.project_id === pid) store.subStart(p.sub_id, p.name || p.sub_name, p.duty || "", p.run_generation); });
+  on("agent://sub-handoff", (p) => { if (p.project_id === pid) store.subStart(p.sub_id, p.name || p.sub_name, p.run_generation); });
 
   // 从后端运行态快照初始化：主 turn 状态 + 子 agent 列表（与 sub-* 事件同一状态集）。
   const core = window.__TAURI__ && window.__TAURI__.core;

@@ -1360,10 +1360,8 @@ async function renderSubAgents() {
   subs.forEach((sa) => {
     const head = document.createElement("div");
     head.className = "sub-head";
-    const dutyText = (sa.duty && sa.duty !== sa.name) ? sa.duty : "";
     head.innerHTML =
       '<span class="sub-name">' + escapeHtml(sa.name) + '</span>' +
-      '<span class="sub-duty">' + escapeHtml(dutyText) + '</span>' +
       '<button class="sub-del" title="删除该子 Agent（删除其全部对话与云端会话）">' +
         '<svg viewBox="0 0 24 24" width="13" height="13"><path d="M6 7h12M9 7V5h6v2M8 7l1 12h6l1-12" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
       '</button>';
@@ -1570,6 +1568,9 @@ listen("agent://project-busy", (e) => {
   if (busy) busyProjects.add(id); else busyProjects.delete(id);
   const el = projectList.querySelector('[data-pid="' + id + '"]');
   if (el) el.classList.toggle("working", busy);
+  const v = views.get(id);
+  if (v) v.running = !!busy;
+  if (activeProjectId === id) setRunning(!!busy);
 });
 
 listen("agent://handoff", () => {});

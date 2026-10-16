@@ -36,8 +36,6 @@ pub struct SubAgent {
     pub id: String,
     pub name: String,
     #[serde(default)]
-    pub duty: String,
-    #[serde(default)]
     pub account: String,
     pub created_at: u64,
     #[serde(default)]
@@ -767,7 +765,7 @@ impl ProjectStore {
             .cloned()
     }
 
-    pub fn add_sub_agent(&mut self, project_id: &str, name: &str, duty: &str, account: &str) -> Option<String> {
+    pub fn add_sub_agent(&mut self, project_id: &str, name: &str, account: &str) -> Option<String> {
         let p = self.project_mut(project_id)?;
         if let Some(existing) = p.sub_agents.iter().find(|s| s.name == name) {
             return Some(existing.id.clone());
@@ -776,7 +774,6 @@ impl ProjectStore {
         p.sub_agents.push(SubAgent {
             id: id.clone(),
             name: name.to_string(),
-            duty: duty.to_string(),
             account: account.to_string(),
             created_at: now_secs(),
             conversations: Vec::new(),

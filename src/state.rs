@@ -69,7 +69,6 @@ pub enum SubRunStatus {
 pub struct SubRunCtx {
     pub sid: String,
     pub name: String,
-    pub duty: String,
     pub project_id: String,
     pub account: String,
     pub agent_type: String,

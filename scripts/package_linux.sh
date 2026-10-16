@@ -79,8 +79,8 @@ export LIGONG_RUNTIME="$DIR/runtime"
 export LIGONG_NODE="$DIR/runtime/node"
 export LIGONG_PLAYWRIGHT="$DIR/runtime/node_modules/playwright"
 export LIGONG_BRIDGE_DIR="$DIR/runtime/bridge"
-# 打包产物默认无头运行；本机需要界面可设 LIGONG_HEADLESS=0 ./run.sh
-export LIGONG_HEADLESS=1
+# 打包产物默认有头运行（需要可见的浏览器窗口）；无头可设 LIGONG_HEADLESS=1 ./run.sh
+export LIGONG_HEADLESS=0
 CHR="$(find "$DIR/runtime/browsers" -maxdepth 3 -name chrome -type f 2>/dev/null | head -1)"
 if [ -n "$CHR" ]; then export LIGONG_CHROMIUM="$CHR"; fi
 exec "$DIR/力工Studio-Rust" "$@"

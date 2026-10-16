@@ -1032,7 +1032,6 @@ html, body {
 .ag-sub.closed .ag-sub-status { color: #888; }
 .ag-sub-body { display: none; padding: 6px 8px; border-top: 1px solid #333; }
 .ag-sub.expanded .ag-sub-body { display: block; }
-.ag-sub-duty { color: #888; font-size: 11px; margin-bottom: 4px; }
 .ag-sub-out { white-space: pre-wrap; margin: 4px 0 0; color: #ccc; font-size: 12px; }
 .agent-status { margin-left: auto; padding: 0 8px; color: #888; font-size: 11px; }
 .agent-input-row {
