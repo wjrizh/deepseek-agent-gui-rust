@@ -1,7 +1,7 @@
 // 底部面板：终端 / 对话 两个 tab 的切换、显隐、快捷键、拖拽调高。
 // 终端内部逻辑在 term.js；对话逻辑在 agent/index.js。
 
-import { ensureTerminal, fitTerminal } from "./term.js";
+import { ensureTerminal, fitTerminal, fitTermOverflow } from "./term.js";
 import { initAgent, isAgentReady } from "./agent/index.js";
 
 let panel, tabTerm, tabAgent, tabPorts, termPane, agentPane, portsPane;
@@ -27,7 +27,7 @@ function applyTab() {
   termPane?.classList.toggle("hidden", !isTerm);
   agentPane?.classList.toggle("hidden", !isAgent);
   portsPane?.classList.toggle("hidden", !isPorts);
-  if (isTerm) fitTerminal();
+  if (isTerm) { fitTerminal(); fitTermOverflow(); }
   if (isPorts && onPortsOpen) onPortsOpen();
 }
 
@@ -90,6 +90,7 @@ export function initBottom({ projectId, cwdProvider }) {
     const h = Math.max(120, Math.min(window.innerHeight - 120, bottom - e.clientY));
     panel.style.height = h + "px";
     fitTerminal();
+    fitTermOverflow();
   });
   window.addEventListener("mouseup", () => { if (dragging) { dragging = false; panel.classList.remove("resizing"); } });
 

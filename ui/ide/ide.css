@@ -899,6 +899,7 @@ html, body {
 .term-head {
   display: flex;
   align-items: center;
+  gap: 6px;
   justify-content: space-between;
   height: 30px;
   padding: 0 6px;
@@ -906,7 +907,7 @@ html, body {
   border-bottom: 1px solid #333;
   flex: 0 0 auto;
 }
-.term-tabs { display: flex; gap: 2px; overflow-x: auto; }
+.term-tabs { flex: 1; min-width: 0; display: flex; gap: 2px; overflow: hidden; align-items: center; }
 .term-tab {
   display: flex;
   align-items: center;
@@ -955,6 +956,13 @@ html, body {
   overflow: hidden;
 }
 .preview-item.hidden { display: none; }
+
+.pdf-frame {
+  width: 100%; height: 100%;
+  flex: 1 1 auto;
+  border: none; border-radius: 6px;
+  background: #fff;
+}
 
 /* —— Agent 对话面板 —— */
 .agent-panel {
@@ -1114,3 +1122,112 @@ html, body {
 }
 /* 拖到空白处 = 移入根目录 */
 .file-tree.drop-root-target { background: rgba(91, 140, 255, 0.05); outline: 1px dashed rgba(91, 140, 255, 0.4); outline-offset: -2px; }
+
+/* ---------- SSH 文件浏览器（iOS 风格） ---------- */
+.ssh-host-row, .ssh-path-row { padding: 0 10px 8px; }
+.ssh-path-input {
+  width: 100%; box-sizing: border-box;
+  background: var(--bg-elev2, rgba(120,120,128,.10));
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 7px 10px;
+  font-size: 12.5px; font-family: inherit;
+  outline: none;
+  transition: border-color .15s, background .15s;
+}
+.ssh-path-input:focus {
+  border-color: var(--accent);
+  background: var(--surface, var(--bg-elev2));
+}
+.ssh-host-select {
+  width: 100%; box-sizing: border-box;
+  appearance: none; -webkit-appearance: none;
+  background-color: var(--bg-elev2, rgba(120,120,128,.10));
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none'><path d='M6 9l6 6 6-6' stroke='%23888' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 7px 28px 7px 10px;
+  font-size: 12.5px; font-family: inherit;
+  outline: none; cursor: pointer;
+  transition: border-color .15s, background-color .15s;
+}
+.ssh-host-select:hover { background-color: rgba(120,120,128,.16); }
+.ssh-host-select:focus { border-color: var(--accent); }
+.ssh-host-select option {
+  background: var(--bg, #1e1e1e);
+  color: var(--fg);
+  font-size: 12.5px;
+}
+.ssh-actions {
+  display: flex; gap: 6px; padding: 0 10px 8px;
+}
+.ssh-act {
+  flex: 1;
+  background: rgba(120,120,128,.12);
+  color: var(--fg);
+  border: none; border-radius: 10px;
+  padding: 6px 0; font-size: 12px; font-family: inherit;
+  cursor: pointer; transition: filter .15s, background .15s;
+}
+.ssh-act:hover { filter: brightness(1.08); background: rgba(120,120,128,.18); }
+.ssh-list {
+  flex: 1; min-height: 0; overflow: auto;
+  padding: 4px 0 10px;
+}
+.ssh-empty { padding: 14px 12px; color: var(--fg-dim); font-size: 12.5px; }
+.ssh-tabs { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 10px 8px; }
+.ssh-tab {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border-radius: 8px; font-size: 11.5px;
+  background: rgba(120,120,128,.12); color: var(--fg-dim);
+  cursor: pointer; border: none; font-family: inherit;
+  transition: background .12s, color .12s;
+}
+.ssh-tab:hover { background: rgba(120,120,128,.2); }
+.ssh-tab.active { background: var(--accent); color: #fff; }
+.ssh-tab .ssh-tab-x { opacity: .7; font-size: 10px; }
+.ssh-tab .ssh-tab-x:hover { opacity: 1; }
+
+/* SSH 标签的主机色点（与普通项目文档同处一个标签栏） */
+.tab-ssh-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); flex-shrink: 0;
+  display: inline-block;
+}
+
+/* SSH 树拖拽高亮 */
+#ssh-list .tree-row.drop-target {
+  background: var(--tree-active);
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+#ssh-list.drop-root-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: -4px;
+}
+
+/* 终端标签折叠（按实际宽度溢出，按钮在行尾） */
+.term-tabs.overflowing .term-tab:not(.active) { display: none; }
+.term-tabs .term-overflow-btn {
+  display: none; flex-shrink: 0; margin-left: auto;
+  padding: 3px 10px; border-radius: 6px; font-size: 11.5px;
+  background: rgba(120,120,128,.16); color: #ccc;
+  border: none; cursor: pointer; font-family: inherit;
+}
+.term-tabs.overflowing .term-overflow-btn { display: inline-flex; }
+.term-overflow-pop {
+  position: absolute; z-index: 200;
+  background: var(--bg-elev2, #252526); border: 1px solid var(--border);
+  border-radius: 10px; padding: 4px; min-width: 160px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.35);
+}
+.term-overflow-pop .pop-item {
+  padding: 6px 10px; border-radius: 7px; font-size: 12px;
+  cursor: pointer; color: var(--fg); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.term-overflow-pop .pop-item:hover { background: var(--tree-hover, rgba(120,120,128,.18)); }

@@ -145,12 +145,73 @@ pub async fn exec(spec: &RemoteSpec, remote_cmd: &str) -> Result<SshOutput, Stri
 }
 
 /// 带自定义超时的远程执行。
+///
+/// 连接层失败（连接未建立 => 命令未执行）会自动重试一次，
+/// 命令执行本身的失败不重试（避免副作用重复执行）。
+///
+/// 若检测到 ControlMaster 复用 socket 损坏（mux_client/Session open refused/already exists），
+/// 会清理坏 socket 并以 `ControlMaster=no` 重试一次，避免坏 socket 持续阻塞。
 pub async fn exec_timeout(
     spec: &RemoteSpec,
     remote_cmd: &str,
     timeout: Duration,
 ) -> Result<SshOutput, String> {
+    let first = exec_timeout_once(spec, remote_cmd, timeout).await?;
+    if is_mux_error(&first) {
+        // 复用 socket 坏了：清理后禁用 mux 重试（连接层问题，命令未执行，安全）。
+        let _ = close_master(spec).await;
+        return exec_timeout_once_nomux(spec, remote_cmd, timeout).await;
+    }
+    if !is_conn_error(&first) {
+        return Ok(first);
+    }
+    // 首次连接失败：重试一次。
+    let r = exec_timeout_once(spec, remote_cmd, timeout).await?;
+    if is_mux_error(&r) {
+        let _ = close_master(spec).await;
+        return exec_timeout_once_nomux(spec, remote_cmd, timeout).await;
+    }
+    Ok(r)
+}
+
+/// `exec_timeout` 的单次执行（不含重试）。
+async fn exec_timeout_once(
+    spec: &RemoteSpec,
+    remote_cmd: &str,
+    timeout: Duration,
+) -> Result<SshOutput, String> {
+    exec_timeout_once_inner(spec, remote_cmd, timeout, true).await
+}
+
+/// 禁用 ControlMaster 的单次执行（用于坏 socket 兜底）。
+async fn exec_timeout_once_nomux(
+    spec: &RemoteSpec,
+    remote_cmd: &str,
+    timeout: Duration,
+) -> Result<SshOutput, String> {
+    exec_timeout_once_inner(spec, remote_cmd, timeout, false).await
+}
+
+async fn exec_timeout_once_inner(
+    spec: &RemoteSpec,
+    remote_cmd: &str,
+    timeout: Duration,
+    use_mux: bool,
+) -> Result<SshOutput, String> {
     let mut args = base_opts(spec);
+    if !use_mux {
+        // 移除 base_opts 里混入的 ControlMaster/ControlPath/ControlPersist，
+        // 显式指定不复用。
+        args.retain(|a| {
+            !a.starts_with("ControlMaster=")
+                && !a.starts_with("ControlPath=")
+                && !a.starts_with("ControlPersist=")
+        });
+        args.push("-o".into());
+        args.push("ControlMaster=no".into());
+        args.push("-o".into());
+        args.push("ControlPath=none".into());
+    }
     args.push(target_string(spec));
     args.push(remote_cmd.to_string());
 
@@ -170,6 +231,40 @@ pub async fn exec_timeout(
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
         stderr: String::from_utf8_lossy(&out.stderr).to_string(),
     })
+}
+
+/// 判定是否为 ControlMaster 复用 socket 损坏。
+/// 特征：mux_client_* / Session open refused by peer / ControlSocket ... already exists。
+fn is_mux_error(o: &SshOutput) -> bool {
+    if o.ok() {
+        return false;
+    }
+    let s = o.stderr.to_lowercase();
+    s.contains("mux_client")
+        || s.contains("session open refused")
+        || s.contains("already exists")
+}
+
+/// 判定是否为连接层失败（stderr 特征匹配）。
+/// 连接未建立时命令不会执行，重试安全。
+fn is_conn_error(o: &SshOutput) -> bool {
+    if o.ok() {
+        return false;
+    }
+    let s = o.stderr.to_lowercase();
+    [
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "closed by remote host",
+        "connection timed out",
+        "no route to host",
+        "kex_exchange_identification",
+        "connection to",
+    ]
+    .iter()
+    .any(|k| s.contains(k))
 }
 
 /// 带 stdin 的远程执行：向远端进程喂数据（如 base64 内容），避免命令行长度限制。
@@ -218,6 +313,69 @@ pub async fn exec_stdin(
     })
 }
 
+/// 可取消的远程执行：支持外部 `CancellationToken`，取消时 kill ssh 子进程。
+///
+/// 与 `exec_timeout` 的差异：`spawn` 子进程而非 `output()`，以便中途 kill。
+/// `kill_on_drop(true)` 保证即使函数提前返回也会清理子进程。
+pub async fn exec_timeout_cancel(
+    spec: &RemoteSpec,
+    remote_cmd: &str,
+    timeout: Duration,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<SshOutput, String> {
+    let mut args = base_opts(spec);
+    args.push(target_string(spec));
+    args.push(remote_cmd.to_string());
+
+    let mut child = TokioCommand::new("ssh")
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("启动 ssh 失败: {e}"))?;
+
+    // 取出 stdout/stderr 句柄，避免在 wait() 期间被借用冲突。
+    // （wait_with_output 会 move self，导致 cancel 分支无法 kill。）
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+
+    let out = tokio::select! {
+        r = tokio::time::timeout(timeout, child.wait()) => match r {
+            Ok(Ok(status)) => {
+                use tokio::io::AsyncReadExt;
+                let mut out_buf = Vec::new();
+                let mut err_buf = Vec::new();
+                if let Some(mut s) = stdout.take() {
+                    let _ = s.read_to_end(&mut out_buf).await;
+                }
+                if let Some(mut s) = stderr.take() {
+                    let _ = s.read_to_end(&mut err_buf).await;
+                }
+                SshOutput {
+                    code: status.code().unwrap_or(-1),
+                    stdout: String::from_utf8_lossy(&out_buf).to_string(),
+                    stderr: String::from_utf8_lossy(&err_buf).to_string(),
+                }
+            }
+            Ok(Err(e)) => return Err(format!("远程命令失败: {e}")),
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(format!("远程命令超时（{}s）", timeout.as_secs()));
+            }
+        },
+        _ = cancel.cancelled() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err("已取消".into());
+        }
+    };
+
+    Ok(out)
+}
+
 /// 把 PowerShell 脚本编码为 UTF-16LE base64，用 `pwsh -EncodedCommand` 包装。
 /// 这样远端只需接收 ASCII，彻底规避引号/中文/换行导致的转义问题。
 pub fn ps_encoded_command(script: &str) -> String {
@@ -243,6 +401,16 @@ pub async fn exec_ps(
     timeout: Duration,
 ) -> Result<SshOutput, String> {
     exec_timeout(spec, &ps_encoded_command(script), timeout).await
+}
+
+/// 可取消的 pwsh 执行（脚本走 EncodedCommand）。
+pub async fn exec_ps_cancel(
+    spec: &RemoteSpec,
+    script: &str,
+    timeout: Duration,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<SshOutput, String> {
+    exec_timeout_cancel(spec, &ps_encoded_command(script), timeout, cancel).await
 }
 
 /// 在远端用 pwsh 执行脚本，并把 stdin 作为数据喂给脚本（`[Console]::In.ReadToEnd()`）。
@@ -327,6 +495,9 @@ pub async fn fetch_host_key(spec: &RemoteSpec) -> Result<Vec<HostKey>, String> {
 }
 
 /// 关闭（复用）主连接。项目关闭或切换时调用，避免 socket 残留。
+///
+/// 先尝试 `ssh -O exit` 通过 mux 协议优雅关闭；无论成败，再直接删除
+/// `ligong-ssh-*` socket 文件，确保坏 socket 不残留。
 pub async fn close_master(spec: &RemoteSpec) -> Result<(), String> {
     let mut args = base_opts(spec);
     args.push("-O".into());
@@ -337,6 +508,20 @@ pub async fn close_master(spec: &RemoteSpec) -> Result<(), String> {
         .stdin(std::process::Stdio::null())
         .output()
         .await;
+    // 兜底：直接清理残留 socket 文件（坏 socket 下 -O exit 无效）。
+    #[cfg(unix)]
+    {
+        let tmp = std::env::temp_dir();
+        if let Ok(entries) = std::fs::read_dir(&tmp) {
+            for e in entries.flatten() {
+                if let Some(name) = e.file_name().to_str() {
+                    if name.starts_with("ligong-ssh-") {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 

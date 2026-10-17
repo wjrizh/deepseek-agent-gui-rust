@@ -71,6 +71,47 @@ pub async fn ide_download_file(
     Ok(())
 }
 
+/// 从远程取文件到本地临时目录，返回本地绝对路径。
+///
+/// 供 `upload_file` 等需要本地文件的场景使用。临时文件落到
+/// `~/.deepseek-agent/remote-uploads/<project_id>/<hash>_<name>`，
+/// 按内容路径 hash 天然去重，同名不冲突；按项目分目录便于统一清理。
+#[tauri::command]
+pub async fn remote_fetch_to_local(
+    project_id: String,
+    rel: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let spec = {
+        let inner = state.inner.lock().await;
+        inner
+            .projects
+            .remote_of(&project_id)
+            .ok_or_else(|| "仅远程项目支持".to_string())?
+    };
+    let (bytes, _size) = backend::read_binary(&spec, &rel)
+        .await
+        .map_err(|e| format!("远程读取失败：{e}"))?;
+
+    let name = rel.rsplit(['/', '\\']).next().unwrap_or("file");
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rel.hash(&mut h);
+        format!("{:x}", h.finish())
+    };
+    let dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".deepseek-agent")
+        .join("remote-uploads")
+        .join(&project_id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+    let local = dir.join(format!("{hash}_{name}"));
+    std::fs::write(&local, &bytes)
+        .map_err(|e| format!("上传失败：写入临时文件出错：{e}"))?;
+    Ok(local.to_string_lossy().to_string())
+}
+
 /// 批量上传：`local_paths` 中每个文件放到远程目录 `rel_dir`（同名）。
 #[tauri::command]
 pub async fn ide_upload_paths(
@@ -139,7 +180,7 @@ pub async fn ide_list_remote_files(
 }
 
 /// 把字节写入远程（按远端平台分派 POSIX/Windows）。
-async fn write_remote_binary(
+pub async fn write_remote_binary(
     spec: &crate::projects::RemoteSpec,
     rel: &str,
     bytes: &[u8],

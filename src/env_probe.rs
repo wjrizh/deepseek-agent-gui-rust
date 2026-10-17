@@ -79,7 +79,8 @@ pub fn probe_remote(remote: Option<&RemoteSpec>, is_win: bool) -> String {
         if is_win { "\\ (反斜杠)" } else { "/ (正斜杠)" }
     ));
     if is_win {
-        lines.push("- 命令语法: Windows + PowerShell（Get-ChildItem/Select-String 等），不要用 sh/ls/cat/grep。".to_string());
+        lines.push("- 命令语法: Windows + PowerShell 7。**统一用 `pwsh`（PowerShell 7），禁止用 `powershell`（5.1，编码不可靠）**。使用 cmdlet（Get-ChildItem/Select-String/Get-Content/Invoke-WebRequest 等）；不要用 sh/ls/cat/grep，也不要用 cmd 的 dir/type。多语句用 `;` 或换行，条件用 `if () { }`，变量用 `$name`，路径含空格用单引号包裹。".to_string());
+        lines.push("- 脚本文件：用 write_file 写入（自动处理 UTF-8 编码与 BOM）；执行用 `pwsh -File <脚本>`，不要用 `powershell`。".to_string());
     } else {
         lines.push("- 命令语法: Unix 环境，可用 sh 语法。".to_string());
     }

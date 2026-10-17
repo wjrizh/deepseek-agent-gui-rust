@@ -92,34 +92,12 @@ export async function renderPreview(host, projectId, rel, name) {
   return { dispose() {} };
 }
 
-// 用 pdf.js 渲染 PDF（逐页 canvas）。pdf.js 缺失时降级提示。
+// 用浏览器原生 PDF 查看器（iframe + data URL），支持缩放与表单填写。
+// 与 SSH 面板一致；现代 WebView 均支持原生 PDF。
 async function renderPdf(body, base64) {
-  let pdfjs;
-  try {
-    pdfjs = await import("../vendor/pdfjs/pdf.mjs");
-  } catch (e) {
-    const tip = document.createElement("div");
-    tip.className = "preview-placeholder";
-    tip.textContent = "PDF 预览不可用（缺少 pdf.js）。请用系统程序打开。";
-    body.append(tip);
-    return { dispose() {} };
-  }
-  pdfjs.GlobalWorkerOptions.workerSrc = "../vendor/pdfjs/pdf.worker.mjs";
-
-  const raw = atob(base64);
-  const bytes = new Uint8Array(raw.length);
-  for (let i = 0; i <raw.length; i++) bytes[i] = raw.charCodeAt(i);
-
-  const doc = await pdfjs.getDocument({ data: bytes }).promise;
-  for (let n = 1; n <= doc.numPages; n++) {
-    const page = await doc.getPage(n);
-    const viewport = page.getViewport({ scale: 1.4 });
-    const canvas = document.createElement("canvas");
-    canvas.className = "preview-pdf-page";
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    body.append(canvas);
-    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-  }
-  return { dispose() { doc.destroy(); } };
+  const frame = document.createElement("iframe");
+  frame.className = "pdf-frame";
+  frame.src = "data:application/pdf;base64," + base64;
+  body.appendChild(frame);
+  return { dispose() { try { frame.remove(); } catch {} } };
 }

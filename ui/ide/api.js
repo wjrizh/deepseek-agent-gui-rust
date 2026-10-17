@@ -239,3 +239,44 @@ export function termResize(id, cols, rows) {
 export function termClose(id) {
   return invoke("term_close", { id });
 }
+
+// —— 独立 SSH 文件浏览器（不依赖项目）——
+export function sshListDir(spec, rel) {
+  return invoke("ssh_list_dir", { spec, rel: rel || "" });
+}
+export function sshCreate(spec, rel, isDir) {
+  return invoke("ssh_create", { spec, rel, isDir });
+}
+export function sshDelete(spec, rel) {
+  return invoke("ssh_delete", { spec, rel });
+}
+export function sshRename(spec, fromRel, toRel) {
+  return invoke("ssh_rename", { spec, fromRel, toRel });
+}
+export function sshMove(spec, fromAbs, toDirAbs) {
+  return invoke("ssh_move", { spec, fromAbs, toDirAbs });
+}
+export function sshDownload(spec, rel, localPath) {
+  return invoke("ssh_download", { spec, rel, localPath });
+}
+export function sshUpload(spec, localPath, relDest) {
+  return invoke("ssh_upload", { spec, localPath, relDest });
+}
+export function sshHosts() {
+  return invoke("remote_ssh_hosts");
+}
+export function sshTailscaleDevices() {
+  return invoke("remote_tailscale_devices");
+}
+export function sshTerminalArgv(spec) {
+  return invoke("ssh_terminal_argv", { spec });
+}
+export function sshReadText(spec, abs) {
+  return invoke("ssh_read_text", { spec, abs });
+}
+export function sshReadBinaryB64(spec, abs) {
+  return invoke("ssh_read_binary_b64", { spec, abs });
+}
+export function sshWriteText(spec, abs, content) {
+  return invoke("ssh_write_text", { spec, abs, content });
+}

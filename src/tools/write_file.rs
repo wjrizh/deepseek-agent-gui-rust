@@ -121,9 +121,19 @@ impl Tool for WriteFile {
             }
         }
 
-        atomic_write(&path, content.as_bytes())?;
+        // .ps1/.psm1/.psd1 加 UTF-8 BOM：PowerShell 5.1 才认 UTF-8。
+        let lower = raw.to_lowercase();
+        let need_bom = lower.ends_with(".ps1") || lower.ends_with(".psm1") || lower.ends_with(".psd1");
+        let bytes: Vec<u8> = if need_bom {
+            let mut v = vec![0xEF, 0xBB, 0xBF];
+            v.extend_from_slice(content.as_bytes());
+            v
+        } else {
+            content.as_bytes().to_vec()
+        };
+        atomic_write(&path, &bytes)?;
 
-        let new_len = content.len();
+        let new_len = bytes.len();
         if existed {
             Ok(format!(
                 "已覆盖写入 {}（{} → {} 字节）",

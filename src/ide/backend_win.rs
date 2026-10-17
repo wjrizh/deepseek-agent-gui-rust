@@ -163,7 +163,17 @@ $bytes=[Convert]::FromBase64String($b64.Trim())
 "#
     .replace("__P__", &ps_lit(&abs));
     use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
+    // .ps1/.psm1/.psd1 加 UTF-8 BOM：万一被 PowerShell 5.1 执行，5.1 才认 UTF-8。
+    let lower = rel.to_lowercase();
+    let need_bom = lower.ends_with(".ps1") || lower.ends_with(".psm1") || lower.ends_with(".psd1");
+    let bytes: Vec<u8> = if need_bom {
+        let mut v = vec![0xEF, 0xBB, 0xBF];
+        v.extend_from_slice(content.as_bytes());
+        v
+    } else {
+        content.as_bytes().to_vec()
+    };
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let out = ssh::exec_ps_stdin(spec, &script, b64.as_bytes(), OP_TIMEOUT).await?;
     if !out.ok() {
         return Err(format!("远程保存失败：{}", out.stderr.trim()));

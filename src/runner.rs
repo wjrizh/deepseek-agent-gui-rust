@@ -1182,7 +1182,7 @@ pub(crate) async fn execute_tool(
         return match call.name.as_str() {
             "execute_command" => {
                 if let Some(spec) = &remote_spec {
-                    crate::tools::remote::exec_remote(spec, &call.params, &mut on_output)
+                    crate::tools::remote::exec_remote(spec, &call.params, &mut on_output, cancel)
                         .await
                         .map_err(|e| e.to_string())
                 } else {
@@ -1194,12 +1194,30 @@ pub(crate) async fn execute_tool(
                         .map_err(|e| e.to_string())
                 }
             }
-            "read_file" => crate::tools::ReadFile::new(cwd)
-                .with_restrict(restrict)
-                .call(&call.params, false, &mut on_output)
-                .await
-                .map_err(|e| e.to_string()),
+            "read_file" => {
+                if let Some(spec) = &remote_spec {
+                    return crate::tools::remote::read_remote(spec, &call.params)
+                        .await
+                        .map_err(|e| e.to_string());
+                }
+                crate::tools::ReadFile::new(cwd)
+                    .with_restrict(restrict)
+                    .call(&call.params, false, &mut on_output)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
             "write_file" | "edit_file" => {
+                if let Some(spec) = &remote_spec {
+                    return if call.name == "write_file" {
+                        crate::tools::remote::write_remote(spec, &call.params)
+                            .await
+                            .map_err(|e| e.to_string())
+                    } else {
+                        crate::tools::remote::edit_remote(spec, &call.params)
+                            .await
+                            .map_err(|e| e.to_string())
+                    };
+                }
                 let target = resolve_tool_path(&call.params, &cwd);
                 let old = target.as_ref().ok()
                     .and_then(|p| std::fs::read_to_string(p).ok())
@@ -1329,6 +1347,15 @@ async fn upload_file_tool(
         return Err(format!("upload_file: 一次最多上传 50 个文件，当前 {}", paths.len()));
     }
 
+    // 远程项目：远程路径 → 本地临时 → 原上传链路。
+    let remote_spec = {
+        let inner = state.inner.lock().await;
+        inner.projects.remote_of(project_id)
+    };
+    if let Some(spec) = &remote_spec {
+        return upload_remote_files_tool(app, state, model, project_id, spec, &paths, cancel).await;
+    }
+
     let mut lines = Vec::new();
     let mut valid: Vec<String> = Vec::new();
     for p in &paths {
@@ -1358,6 +1385,20 @@ async fn upload_file_tool(
         return Ok(joined);
     }
 
+    do_upload_files(app, state, model, project_id, &valid, &mut lines, cancel).await
+}
+
+/// 公共上传尾部：解析 sid/pid → model.upload_files → 登记 pending_files → 广播。
+/// 本地与远程分支共用，`valid` 必须是已存在的本地路径，`lines` 为已累积的逐文件状态。
+async fn do_upload_files(
+    app: &AppHandle,
+    state: &AppState,
+    model: &Arc<dyn Model>,
+    project_id: &str,
+    valid: &[String],
+    lines: &mut Vec<String>,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
     let (sid, pid) = {
         let inner = state.inner.lock().await;
         let pid = inner
@@ -1376,12 +1417,12 @@ async fn upload_file_tool(
 
     let _ = state.ensure_run_ctx(&pid).await;
 
-    let upload_fut = model.upload_files(sid.as_deref(), &valid);
+    let upload_fut = model.upload_files(sid.as_deref(), valid);
     let n = tokio::select! {
         r = upload_fut => r.map_err(|e| format!("上传失败：{e}"))?,
         _ = cancel.cancelled() => return Err("已取消".into()),
     };
-    for p in &valid {
+    for p in valid {
         lines.push(format!("[✓] 已上传: {p}"));
     }
     lines.push(format!("共上传 {n} 个文件。"));
@@ -1389,7 +1430,7 @@ async fn upload_file_tool(
     {
         let mut inner = state.inner.lock().await;
         if let Some(ctx) = inner.running.get_mut(&pid) {
-            for p in &valid {
+            for p in valid {
                 let name = std::path::Path::new(p)
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -1421,4 +1462,77 @@ async fn upload_file_tool(
         }),
     );
     Ok(joined)
+}
+
+/// 远程项目上传：远程路径 → 本地临时 → 走 `do_upload_files`。
+async fn upload_remote_files_tool(
+    app: &AppHandle,
+    state: &AppState,
+    model: &Arc<dyn Model>,
+    project_id: &str,
+    spec: &crate::projects::RemoteSpec,
+    paths: &[String],
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    let mut lines = Vec::new();
+    let mut valid_local: Vec<String> = Vec::new();
+    for p in paths {
+        // 解析 rel：先按绝对路径（在 root 下），失败当 rel 透传。
+        let rel = match crate::ide::backend::to_rel(spec, p.trim())
+            .ok()
+            .filter(|r| !r.is_empty())
+        {
+            Some(r) => r,
+            None => p.trim().replace('\\', "/").trim_start_matches('/').to_string(),
+        };
+        if rel.is_empty() {
+            lines.push(format!("[!] 无效路径: {p}"));
+            continue;
+        }
+        // 远程读取 → 本地临时（复用 read_binary 的 64MiB 上限 + Windows/POSIX 分派）。
+        match crate::ide::backend::read_binary(spec, &rel).await {
+            Ok((bytes, _)) => {
+                if bytes.len() as u64 > 100 * 1024 * 1024 {
+                    lines.push(format!("[!] 文件超过 100MB 上限: {p}"));
+                    continue;
+                }
+                let name = rel.rsplit(['/', '\\']).next().unwrap_or("file");
+                let hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    rel.hash(&mut h);
+                    format!("{:x}", h.finish())
+                };
+                let dir = dirs::home_dir().unwrap_or_default()
+                    .join(".deepseek-agent")
+                    .join("remote-uploads")
+                    .join(project_id);
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    lines.push(format!("[!] 创建临时目录失败: {e}"));
+                    continue;
+                }
+                let local = dir.join(format!("{hash}_{name}"));
+                match std::fs::write(&local, &bytes) {
+                    Ok(_) => valid_local.push(local.to_string_lossy().to_string()),
+                    Err(e) => lines.push(format!("[!] 上传失败（写临时文件）: {p}：{e}")),
+                }
+            }
+            Err(e) => lines.push(format!("[!] 远程读取失败: {p}：{e}")),
+        }
+    }
+    if valid_local.is_empty() {
+        let joined = lines.join("\n");
+        let _ = app.emit(
+            "agent://tool",
+            serde_json::json!({
+                "project_id": project_id,
+                "phase": "output",
+                "name": "upload_file",
+                "output": &joined,
+            }),
+        );
+        return Ok(joined);
+    }
+
+    do_upload_files(app, state, model, project_id, &valid_local, &mut lines, cancel).await
 }

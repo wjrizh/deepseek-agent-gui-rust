@@ -15,8 +15,10 @@ import {
   forwardOpen, forwardClose, forwardList,
 } from "./api.js";
 import { initTerminal, newRemoteTerminal } from "./term.js";
-import { initBottom, toggleBottom, setProjectId, setPortsHandlers } from "./bottom.js";
-import { getProjectRemote, setProjectRemote, remoteTerminalArgv } from "./api.js";
+import { initBottom, toggleBottom, showBottom, setProjectId, setPortsHandlers } from "./bottom.js";
+import { getProjectRemote, setProjectRemote, remoteTerminalArgv,
+  sshListDir, sshCreate, sshDelete, sshRename, sshMove, sshDownload, sshUpload,
+  sshHosts, sshTailscaleDevices, sshTerminalArgv, sshReadText, sshReadBinaryB64, sshWriteText } from "./api.js";
 
 // 剪贴板：仅记录一次复制/剪切操作的相对路径，粘贴时读取。
 let clip = null; // { items: [{rel, isDir}], mode: "copy" | "cut" }
@@ -62,6 +64,7 @@ const els = {
   activitybar: document.getElementById("activitybar"),
   explorerPane: document.getElementById("explorer-pane"),
   scmPane: document.getElementById("scm-pane"),
+  sshPane: document.getElementById("ssh-pane"),
   actBadge: document.getElementById("act-scm-badge"),
   scmBody: document.getElementById("scm-body"),
   scmEmpty: document.getElementById("scm-empty"),
@@ -129,19 +132,34 @@ function updateMeta() {
   if (!editor) { els.statusMeta.textContent = ""; return; }
   const model = editor.getModel();
   const lines = model ? model.getLineCount() : 0;
-  els.statusMeta.textContent = `${lines} 行 · ${langForPath(activeRel)}`;
+  const langKey = doc.ssh ? doc.ssh.abs : activeRel;
+  els.statusMeta.textContent = `${lines} 行 · ${langForPath(langKey)}`;
+}
+
+function docDisplay(key, doc) {
+  return doc.ssh ? doc.ssh.name : key.split("/").pop();
+}
+function docTitle(key, doc) {
+  return doc.ssh ? doc.ssh.abs : key;
 }
 
 function renderTabs() {
   els.tabs.innerHTML = "";
   for (const [rel, doc] of openDocs) {
+    const isSsh = !!doc.ssh;
     const tab = document.createElement("div");
     tab.className = "tab" + (rel === activeRel ? " active" : "");
     tab.dataset.rel = rel;
+    if (isSsh) {
+      const dot = document.createElement("span");
+      dot.className = "tab-ssh-dot";
+      dot.title = "SSH: " + (doc.ssh.hostKey || "");
+      tab.appendChild(dot);
+    }
     const name = document.createElement("span");
     name.className = "tab-name";
-    name.textContent = rel.split("/").pop();
-    name.title = rel;
+    name.textContent = docDisplay(rel, doc);
+    name.title = docTitle(rel, doc);
     const dirty = document.createElement("span");
     dirty.className = "tab-dirty" + (doc.dirty ? "" : " hidden");
     dirty.textContent = "●";
@@ -990,7 +1008,10 @@ function switchView(view) {
   });
   els.explorerPane.classList.toggle("hidden", view !== "explorer");
   els.scmPane.classList.toggle("hidden", view !== "scm");
+  els.sshPane?.classList.toggle("hidden", view !== "ssh");
+
   if (view === "scm") refreshGit();
+  if (view === "ssh") sshInit();
 }
 
 // 活动栏 SCM 图标上的更改数角标。
@@ -1181,8 +1202,8 @@ function activateTab(rel) {
   if (!doc) return;
   activeRel = rel;
   if (blameOn && blameRel !== rel) clearBlame();
-  els.statusPath.textContent = rel;
-  els.breadcrumb.textContent = rel;
+  els.statusPath.textContent = docTitle(rel, doc);
+  els.breadcrumb.textContent = docTitle(rel, doc);
 
   const isPreview = doc.kind === "preview";
   els.previewHost.classList.toggle("hidden", !isPreview);
@@ -1208,7 +1229,7 @@ async function closeTab(rel) {
   if (doc.dirty) {
     const ok = await showModal({
       title: "未保存的修改",
-      text: `「${rel.split("/").pop()}」有未保存的修改，仍要关闭吗？`,
+      text: `「${docDisplay(rel, doc)}」有未保存的修改，仍要关闭吗？`,
       okText: "关闭",
       danger: true,
     });
@@ -1240,6 +1261,20 @@ async function closeTab(rel) {
 async function save() {
   const doc = activeDoc();
   if (!doc || !activeRel || doc.kind === "preview") return;
+  // SSH 文档写回远程主机。
+  if (doc.ssh) {
+    try {
+      await sshWriteText(doc.ssh.spec, doc.ssh.abs, doc.model.getValue());
+      doc.savedValue = doc.model.getValue();
+      doc.dirty = false;
+      setGlobalDirty();
+      renderTabs();
+      els.statusPath.textContent = "已保存：" + doc.ssh.abs;
+    } catch (e) {
+      els.statusPath.textContent = "保存失败：" + e;
+    }
+    return;
+  }
   const value = doc.model.getValue();
   try {
     await writeFile(projectId, activeRel, value);
@@ -1310,6 +1345,13 @@ function showModal({ title, input, text, okText, danger, defaultValue }) {
 
     setTimeout(() => { if (input) { iEl.focus(); iEl.select(); } }, 30);
   });
+}
+
+function modalPrompt(title, defaultValue) {
+  return showModal({ title, input: true, defaultValue: defaultValue || "" });
+}
+function modalConfirm(text) {
+  return showModal({ title: "确认", text, okText: "确定" });
 }
 
 // —— 上一层：切树根并把项目工作目录同步过去，主 UI 顶栏会实时跟随 ——
@@ -2114,3 +2156,553 @@ function installFsWatch() {
 }
 
 boot();
+
+
+// —— 独立 SSH 文件浏览器（不依赖项目，多主机会话，树形懒加载） ——
+const sshSessions = new Map(); // key: hostKey -> { spec, curAbs, label, treeCache, expanded }
+let sshActiveKey = null;
+let sshInited = false;
+// SSH 文档并入 openDocs，key 形如 ssh::{hostKey}::{abs}，用 doc.ssh 区分来源。
+function sshActive() {
+  return sshActiveKey ? sshSessions.get(sshActiveKey) : null;
+}
+
+async function sshInit() {
+  if (sshInited) return;
+  sshInited = true;
+  await sshFillHosts();
+  document.getElementById("ssh-host")?.addEventListener("change", sshOnPickHost);
+  document.getElementById("ssh-path")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") sshLoad(e.target.value.trim());
+  });
+  document.getElementById("ssh-up")?.addEventListener("click", () => {
+    const s = sshActive(); if (s) sshLoad(sshParent(s.curAbs));
+  });
+  document.getElementById("ssh-refresh")?.addEventListener("click", () => {
+    const s = sshActive(); if (s) sshLoad(s.curAbs);
+  });
+  document.getElementById("ssh-terminal")?.addEventListener("click", sshOpenTerminal);
+  document.getElementById("ssh-upload")?.addEventListener("click", sshUploadToCur);
+  document.getElementById("ssh-newfile")?.addEventListener("click", () => sshCreateEntry(false));
+  document.getElementById("ssh-newdir")?.addEventListener("click", () => sshCreateEntry(true));
+  // 列表空白处右键菜单（行上用自己的菜单，避免双重弹出）
+  document.getElementById("ssh-list")?.addEventListener("contextmenu", (e) => {
+    if (e.target.closest(".tree-row")) return; // 项上自己的菜单（现在行用 tree-row）
+    e.preventDefault();
+    sshBlankMenu(e);
+  });
+  // 空白区拖到当前目录。
+  const sshListEl = document.getElementById("ssh-list");
+  sshListEl?.addEventListener("dragover", (ev) => {
+    if (!window.__sshDragSrc) return;
+    if (ev.target.closest(".tree-row")) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = "move";
+    sshListEl.classList.add("drop-root-target");
+  });
+  sshListEl?.addEventListener("dragleave", (ev) => {
+    if (!sshListEl.contains(ev.relatedTarget)) sshListEl.classList.remove("drop-root-target");
+  });
+  sshListEl?.addEventListener("drop", async (ev) => {
+    if (ev.target.closest(".tree-row")) return;
+    const s = sshActive(); if (!s) return;
+    const src = window.__sshDragSrc;
+    sshListEl.classList.remove("drop-root-target");
+    if (!src) return;
+    ev.preventDefault();
+    await sshMoveTo(src, s.curAbs);
+  });
+}
+
+async function sshFillHosts() {
+  const sel = document.getElementById("ssh-host");
+  if (!sel) return;
+  sel.innerHTML = '<option value="">— 选择主机 —</option>';
+  let sshList = [], tsList = [];
+  try { sshList = await sshHosts(); } catch (e) { els.statusPath.textContent = "读取 SSH 主机失败：" + e; }
+  try { tsList = await sshTailscaleDevices(); } catch (e) { /* tailscale 不可用忽略 */ }
+  for (const h of sshList || []) {
+    const o = document.createElement("option");
+    o.value = "ssh:" + JSON.stringify(h);
+    o.textContent = "SSH: " + h.alias + (h.hostname && h.hostname !== h.alias ? " → " + h.hostname : "");
+    sel.appendChild(o);
+  }
+  for (const d of tsList || []) {
+    if (d.is_self) continue;
+    const o = document.createElement("option");
+    o.value = "ts:" + JSON.stringify(d);
+    o.textContent = "Tailscale: " + d.name + (d.online ? "" : "（离线）");
+    sel.appendChild(o);
+  }
+}
+
+function sshOnPickHost(e) {
+  const v = e.target.value;
+  if (!v) return;
+  const isSsh = v.startsWith("ssh:");
+  let spec, label;
+  try {
+    const obj = JSON.parse(v.slice(isSsh ? 4 : 3));
+    if (isSsh) {
+      spec = { host: obj.hostname || obj.alias, user: obj.user || null, port: obj.port || null,
+        ssh_alias: obj.alias || null, root: "", proxy_jump: null, restrict: false };
+      label = obj.alias || spec.host;
+    } else {
+      spec = { host: obj.dns_name || obj.ip, user: null, port: null, ssh_alias: null,
+        root: "", proxy_jump: null, restrict: false };
+      label = obj.name || spec.host;
+    }
+  } catch (err) { els.statusPath.textContent = "解析主机失败：" + err; return; }
+  const key = label + "|" + spec.host;
+  if (!sshSessions.has(key)) {
+    sshSessions.set(key, { spec, curAbs: "", label, treeCache: new Map(), expanded: new Set() });
+  }
+  sshActiveKey = key;
+  sshRenderTabs();
+  sshLoad("");
+  e.target.value = "";
+}
+
+function sshRenderTabs() {
+  const box = document.getElementById("ssh-tabs");
+  if (!box) return;
+  box.innerHTML = "";
+  for (const [key, s] of sshSessions) {
+    const tab = document.createElement("button");
+    tab.className = "ssh-tab" + (key === sshActiveKey ? " active" : "");
+    const label = document.createElement("span");
+    label.textContent = s.label;
+    const x = document.createElement("span");
+    x.className = "ssh-tab-x";
+    x.textContent = "✕";
+    x.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      sshSessions.delete(key);
+      // 关闭该主机的所有 SSH 编辑器标签（key 前缀 ssh::{hostKey}::）。
+      const prefix = "ssh::" + key + "::";
+      for (const [k, doc] of [...openDocs]) {
+        if (k.startsWith(prefix)) {
+          openDocs.delete(k);
+          try { doc.model?.dispose?.(); } catch {}
+          if (activeRel === k) activeRel = null;
+        }
+      }
+      renderTabs();
+      setGlobalDirty();
+      if (sshActiveKey === key) {
+        const next = sshSessions.keys().next();
+        sshActiveKey = next.done ? null : next.value;
+        if (sshActiveKey) sshLoad(sshSessions.get(sshActiveKey).curAbs);
+        else {
+          document.getElementById("ssh-list").innerHTML = "";
+          document.getElementById("ssh-path").value = "";
+        }
+      }
+      sshRenderTabs();
+      // 若当前激活标签被删，切到下一个；没有则回欢迎页。
+      if (activeRel && openDocs.has(activeRel)) {
+        activateTab(activeRel);
+      } else if (!activeRel) {
+        editor?.setModel(null);
+        els.previewHost?.classList.add("hidden");
+        els.monacoHost?.classList.add("hidden");
+        els.welcome?.classList.remove("hidden");
+        els.statusPath.textContent = "就绪";
+        els.statusMeta.textContent = "";
+      }
+    });
+    tab.append(label, x);
+    tab.addEventListener("click", () => {
+      sshActiveKey = key;
+      sshRenderTabs();
+      sshLoad(s.curAbs);
+    });
+    box.appendChild(tab);
+  }
+}
+
+function sshParent(p) {
+  if (!p) return "";
+  const win = /^[A-Za-z]:/.test(p) || p.includes("\\");
+  if (win) {
+    const norm = p.replace(/[\\/]+$/, "");
+    if (/^[A-Za-z]:$/.test(norm)) return norm + "\\";
+    const i = Math.max(norm.lastIndexOf("\\"), norm.lastIndexOf("/"));
+    if (i <= 1) return norm.slice(0, 2) + "\\";
+    const parent = norm.slice(0, i);
+    return /^[A-Za-z]:$/.test(parent) ? parent + "\\" : parent;
+  }
+  const norm = p.replace(/\/+$/, "");
+  if (norm === "" || norm === "/") return "/";
+  const i = norm.lastIndexOf("/");
+  return i <= 0 ? "/" : norm.slice(0, i);
+}
+
+function sshJoin(base, name) {
+  if (!base) return name;
+  const win = /^[A-Za-z]:/.test(base) || base.includes("\\");
+  const sep = win ? "\\" : "/";
+  return base.replace(/[\\/]+$/, "") + sep + name;
+}
+
+function sshFmtSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+async function sshLoad(absPath) {
+  const s = sshActive();
+  if (!s) { els.statusPath.textContent = "请先选择主机"; return; }
+  const list = document.getElementById("ssh-list");
+  const pathEl = document.getElementById("ssh-path");
+  list.innerHTML = '<div class="ssh-empty">加载中…</div>';
+  const spec = { ...s.spec, root: absPath || s.spec.root || "" };
+  try {
+    const res = await sshListDir(spec, "");
+    const entries = res.entries || [];
+    // 后端可能兜底解析了真实路径（空 root 时），用回传的 path 同步 curAbs。
+    s.curAbs = res.path || "";
+    s.spec.root = s.curAbs;
+    pathEl.value = s.curAbs;
+    s.treeCache = new Map([[s.curAbs, entries]]);
+    s.expanded = new Set();
+    sshRenderTree();
+  } catch (err) {
+    list.innerHTML = "";
+    const e = document.createElement("div");
+    e.className = "ssh-empty";
+    e.textContent = "加载失败：" + err;
+    list.appendChild(e);
+  }
+}
+
+// 刷新单个目录的条目并保持已展开子目录（用于新建/删除后局部刷新）。
+async function sshRefreshDir(abs) {
+  const s = sshActive(); if (!s) return;
+  try {
+    const spec = { ...s.spec, root: abs };
+    const res = await sshListDir(spec, "");
+    s.treeCache.set(abs, res.entries || []);
+    sshRenderTree();
+  } catch (e) { els.statusPath.textContent = "刷新失败：" + e; }
+}
+
+function sshRenderTree() {
+  const s = sshActive(); if (!s) return;
+  const list = document.getElementById("ssh-list");
+  list.innerHTML = "";
+  const rootEntries = s.treeCache.get(s.curAbs) || [];
+  if (!rootEntries.length) {
+    list.innerHTML = '<div class="ssh-empty">（空目录）</div>';
+    return;
+  }
+  sshRenderLevel(s.curAbs, rootEntries, 0, list);
+}
+
+function sshRenderLevel(dirAbs, entries, depth, container) {
+  const s = sshActive(); if (!s) return;
+  for (const it of entries) {
+    const childAbs = sshJoin(dirAbs, it.name);
+    const row = document.createElement("div");
+    row.className = "tree-row";
+    row.draggable = true;
+    row.dataset.abs = childAbs;
+    row.dataset.isDir = it.is_dir ? "1" : "0";
+
+    // 三角（SVG，同资源管理器）
+    const twisty = document.createElement("span");
+    twisty.className = "tree-twisty" + (it.is_dir ? (s.expanded.has(childAbs) ? " open" : "") : " empty");
+    if (it.is_dir) {
+      twisty.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none"><path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    }
+
+    const icon = document.createElement("span");
+    icon.className = "tree-icon";
+    icon.textContent = it.is_dir ? "📁" : "📄";
+
+    const label = document.createElement("span");
+    label.className = "tree-label";
+    label.textContent = it.name;
+    label.title = it.name;
+
+    row.append(twisty, icon, label);
+    row.style.paddingLeft = (6 + depth * 14) + "px";
+    row.title = it.is_dir ? it.name + "（双击进入）" : it.name;
+
+    let clickTimer = null;
+    row.addEventListener("click", async (ev) => {
+      if (!it.is_dir) {
+        sshOpenFile(childAbs, it.name);
+        return;
+      }
+      if (ev.detail === 2) {
+        clearTimeout(clickTimer);
+        sshLoad(childAbs);          // 进入：该目录成为新根，树只显示它
+        return;
+      }
+      clearTimeout(clickTimer);
+      clickTimer = setTimeout(async () => {
+        if (s.expanded.has(childAbs)) {
+          s.expanded.delete(childAbs);
+        } else {
+          s.expanded.add(childAbs);
+          if (!s.treeCache.has(childAbs)) {
+            try {
+              const res = await sshListDir({ ...s.spec, root: childAbs }, "");
+              s.treeCache.set(childAbs, res.entries || []);
+            } catch (e) {
+              els.statusPath.textContent = "展开失败：" + e;
+              s.expanded.delete(childAbs);
+            }
+          }
+        }
+        sshRenderTree();
+      }, 220);
+    });
+    row.addEventListener("contextmenu", (e) => { e.preventDefault(); sshContextMenu(e, it, childAbs); });
+
+    // 拖拽移动
+    row.addEventListener("dragstart", (ev) => {
+      ev.dataTransfer.effectAllowed = "move";
+      ev.dataTransfer.setData("text/plain", childAbs);
+      row.classList.add("dragging");
+      window.__sshDragSrc = childAbs;
+      window.__sshDragIsDir = !!it.is_dir;
+    });
+    row.addEventListener("dragend", () => {
+      row.classList.remove("dragging");
+      window.__sshDragSrc = null;
+      clearSshDropVisual();
+    });
+    row.addEventListener("dragover", (ev) => {
+      const src = window.__sshDragSrc;
+      if (!src) return;
+      const targetDir = it.is_dir ? childAbs : sshParent(childAbs);
+      if (src === targetDir || sshJoin(targetDir, src.split(/[\\/]/).pop()) === src) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      ev.dataTransfer.dropEffect = "move";
+      clearSshDropVisual();
+      row.classList.add("drop-target");
+    });
+    row.addEventListener("drop", async (ev) => {
+      const src = window.__sshDragSrc;
+      clearSshDropVisual();
+      if (!src) return;
+      const targetDir = it.is_dir ? childAbs : sshParent(childAbs);
+      ev.preventDefault();
+      ev.stopPropagation();
+      await sshMoveTo(src, targetDir);
+    });
+    container.appendChild(row);
+
+    if (it.is_dir && s.expanded.has(childAbs)) {
+      const sub = s.treeCache.get(childAbs) || [];
+      sshRenderLevel(childAbs, sub, depth + 1, container);
+    }
+  }
+}
+
+function clearSshDropVisual() {
+  document.querySelectorAll("#ssh-list .drop-target, #ssh-list .drop-root-target")
+    .forEach((el) => el.classList.remove("drop-target", "drop-root-target"));
+}
+
+async function sshMoveTo(fromAbs, toDirAbs) {
+  const s = sshActive(); if (!s) return;
+  if (!fromAbs || !toDirAbs) return;
+  // 同目录忽略。
+  if (sshParent(fromAbs) === toDirAbs) return;
+  els.statusPath.textContent = "移动中…";
+  try {
+    await sshMove(s.spec, fromAbs, toDirAbs);
+    // 清缓存，重新加载受影响目录。
+    s.treeCache = new Map([[s.curAbs, s.treeCache.get(s.curAbs) || []]]);
+    await sshLoad(s.curAbs);
+    els.statusPath.textContent = "已移动";
+  } catch (e) { els.statusPath.textContent = "移动失败：" + e; }
+}
+
+// 在指定位置弹出右键菜单。
+function sshShowMenu(e, items) {
+  const menu = ensureMenu();
+  menu.innerHTML = "";
+  for (const [label, fn] of items) {
+    const d = document.createElement("div");
+    d.className = "ctx-item";
+    d.textContent = label;
+    d.addEventListener("click", () => { hideMenu(); fn(); });
+    menu.appendChild(d);
+  }
+  menu.classList.remove("hidden");
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.min(e.clientX, window.innerWidth - r.width - 6) + "px";
+  menu.style.top = Math.min(e.clientY, window.innerHeight - r.height - 6) + "px";
+}
+
+function sshContextMenu(e, it, childAbs) {
+  const s = sshActive(); if (!s) return;
+  const items = [];
+  if (it.is_dir) {
+    items.push(["在此处打开", () => sshLoad(childAbs)]);
+    items.push(["上传文件到此处…", () => sshUploadToDir(childAbs)]);
+    items.push(["新建文件…", () => sshCreateEntry(false, childAbs)]);
+    items.push(["新建文件夹…", () => sshCreateEntry(true, childAbs)]);
+  } else {
+    items.push(["下载到本地…", () => sshDownloadEntry(it.name)]);
+  }
+  items.push(["重命名…", () => sshRenameEntry(it.name)]);
+  items.push(["删除", () => sshDeleteEntry(it.name)]);
+  sshShowMenu(e, items);
+}
+
+function sshBlankMenu(e) {
+  const s = sshActive(); if (!s) return;
+  const items = [
+    ["上传文件到此处…", () => sshUploadToDir(s.curAbs)],
+    ["新建文件…", () => sshCreateEntry(false)],
+    ["新建文件夹…", () => sshCreateEntry(true)],
+    ["刷新", () => sshLoad(s.curAbs)],
+  ];
+  sshShowMenu(e, items);
+}
+
+async function sshDownloadEntry(name) {
+  const s = sshActive(); if (!s) return;
+  const save = await window.__TAURI__.dialog.save({ title: "保存到本地", defaultPath: name });
+  if (!save) return;
+  els.statusPath.textContent = "下载中…";
+  try {
+    await sshDownload({ ...s.spec, root: s.curAbs }, name, save);
+    els.statusPath.textContent = "已下载：" + save;
+  } catch (e) { els.statusPath.textContent = "下载失败：" + e; }
+}
+
+async function sshUploadToDir(dirAbs) {
+  const s = sshActive(); if (!s) return;
+  const picked = await window.__TAURI__.dialog.open({ multiple: true, title: "选择要上传的文件" });
+  if (!picked) return;
+  const paths = Array.isArray(picked) ? picked : [picked];
+  els.statusPath.textContent = "上传中…";
+  let ok = 0, fail = 0;
+  for (const p of paths) {
+    const name = p.split(/[\\/]/).pop();
+    try { await sshUpload({ ...s.spec, root: dirAbs }, p, name); ok++; } catch { fail++; }
+  }
+  els.statusPath.textContent = `上传完成：成功 ${ok}，失败 ${fail}`;
+  await sshRefreshDir(dirAbs);
+}
+
+async function sshUploadToCur() {
+  const s = sshActive(); if (!s) { els.statusPath.textContent = "请先选择主机"; return; }
+  if (!s.curAbs) { els.statusPath.textContent = "请先进入一个目录"; return; }
+  await sshUploadToDir(s.curAbs);
+}
+
+async function sshCreateEntry(isDir, dirAbs) {
+  const s = sshActive(); if (!s) return;
+  const base = dirAbs || s.curAbs;
+  const name = await showModal({ title: isDir ? "新建文件夹" : "新建文件", input: true });
+  if (!name) return;
+  try {
+    await sshCreate({ ...s.spec, root: base }, name, isDir);
+    await sshRefreshDir(base);
+    els.statusPath.textContent = "已创建：" + name;
+  } catch (e) { els.statusPath.textContent = "创建失败：" + e; }
+}
+
+async function sshRenameEntry(oldName) {
+  const s = sshActive(); if (!s) return;
+  const name = await showModal({ title: "重命名", input: true, defaultValue: oldName });
+  if (!name || name === oldName) return;
+  try {
+    await sshRename({ ...s.spec, root: s.curAbs }, oldName, name);
+    await sshRefreshDir(s.curAbs);
+    els.statusPath.textContent = "已重命名：" + name;
+  } catch (e) { els.statusPath.textContent = "重命名失败：" + e; }
+}
+
+async function sshDeleteEntry(name) {
+  const s = sshActive(); if (!s) return;
+  const yes = await showModal({
+    title: "删除确认",
+    text: `确定删除「${name}」？此操作不可恢复。`,
+    danger: true,
+    okText: "删除",
+  });
+  if (!yes) return;
+  try {
+    await sshDelete({ ...s.spec, root: s.curAbs }, name);
+    await sshRefreshDir(s.curAbs);
+    els.statusPath.textContent = "已删除：" + name;
+  } catch (e) { els.statusPath.textContent = "删除失败：" + e; }
+}
+
+// SSH 文档并入统一标签栏（openDocs），key：ssh::{hostKey}::{abs}，用 doc.ssh 区分来源。
+async function sshOpenFile(abs, name) {
+  const s = sshActive(); if (!s) return;
+  const key = "ssh::" + sshActiveKey + "::" + abs;
+  if (openDocs.has(key)) { activateTab(key); return; }
+
+  const kind = previewKind(name);
+  if (kind) {
+    // 图片 / PDF 等预览：走按 spec 的二进制预览。
+    const el = document.createElement("div");
+    el.className = "preview-item hidden";
+    els.previewHost.append(el);
+    let dispose = () => {};
+    try {
+      const b64 = await sshReadBinaryB64(s.spec, abs);
+      if (kind === "image") {
+        const ext = name.split(".").pop().toLowerCase();
+        const mime = ext === "svg" ? "image/svg+xml" : "image/" + (ext === "jpg" ? "jpeg" : ext);
+        const img = document.createElement("img");
+        img.src = "data:" + mime + ";base64," + b64;
+        img.style.maxWidth = "100%"; img.style.maxHeight = "100%";
+        el.appendChild(img);
+      } else if (kind === "pdf") {
+        const frame = document.createElement("iframe");
+        frame.src = "data:application/pdf;base64," + b64;
+        frame.style.width = "100%"; frame.style.height = "100%"; frame.style.border = "none";
+        el.appendChild(frame);
+      } else {
+        el.textContent = "该格式暂不支持预览";
+      }
+    } catch (e) {
+      els.statusPath.textContent = "预览失败：" + e;
+      el.remove();
+      return;
+    }
+    openDocs.set(key, {
+      kind: "preview", dirty: false, el, dispose,
+      ssh: { spec: { ...s.spec }, abs, hostKey: sshActiveKey, name },
+    });
+    activateTab(key);
+    return;
+  }
+
+  // 文本
+  let text = "";
+  try { text = await sshReadText(s.spec, abs); }
+  catch (e) { els.statusPath.textContent = "读取失败：" + e; return; }
+  await ensureEditor();
+  const model = monaco.editor.createModel(text, langForPath(name));
+  openDocs.set(key, {
+    kind: "text", model, dirty: false, savedValue: text,
+    ssh: { spec: { ...s.spec }, abs, hostKey: sshActiveKey, name },
+  });
+  lastSnap.set(key, text);
+  activateTab(key);
+}
+
+async function sshOpenTerminal() {
+  const s = sshActive(); if (!s) { els.statusPath.textContent = "请先选择主机"; return; }
+  els.statusPath.textContent = "打开远程终端…";
+  try {
+    const argv = await sshTerminalArgv({ ...s.spec, root: s.curAbs });
+    newRemoteTerminal(argv.prog, argv.args, "SSH " + (argv.label || s.label));
+    showBottom("term");
+    els.statusPath.textContent = "远程终端已打开：" + (argv.label || s.label);
+  } catch (e) { els.statusPath.textContent = "打开终端失败：" + e; }
+}

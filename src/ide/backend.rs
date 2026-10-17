@@ -109,6 +109,42 @@ pub fn ps_lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// 简单判定是否为 Windows 风格路径（盘符如 `C:` 或含反斜杠）。
+pub fn is_windows_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    (b.len() >= 2 && b[1] == b':') || p.contains('\\')
+}
+
+/// 把远程绝对路径转成相对 `spec.root` 的 rel（与 win_resolve/posix_resolve 同规则）。
+/// 越界或不在 root 下返回 Err。rel 为空表示 root 本身。
+pub fn to_rel(spec: &RemoteSpec, abs: &str) -> Result<String, String> {
+    if is_windows_path(abs) {
+        let root = normalize_win(&spec.root);
+        let target = normalize_win(abs);
+        let r = root.to_lowercase();
+        let t = target.to_lowercase();
+        if t == r {
+            return Ok(String::new());
+        }
+        let prefix = format!("{r}/");
+        if !t.starts_with(&prefix) {
+            return Err(format!("路径不在项目根目录下：{abs}"));
+        }
+        Ok(target[r.len() + 1..].to_string())
+    } else {
+        let root = normalize_posix(&spec.root);
+        let target = normalize_posix(abs);
+        if target == root {
+            return Ok(String::new());
+        }
+        let prefix = format!("{root}/");
+        if !target.starts_with(&prefix) {
+            return Err(format!("路径不在项目根目录下：{abs}"));
+        }
+        Ok(target[prefix.len()..].to_string())
+    }
+}
+
 /// 列出一个远程目录（不递归）。`rel` 为空表示 root。
 pub async fn list_dir(spec: &RemoteSpec, rel: &str) -> Result<Vec<DirEntry>, String> {
     if is_windows_remote(spec).await {
@@ -232,7 +268,17 @@ pub async fn write_file(spec: &RemoteSpec, rel: &str, content: &str) -> Result<(
     }
     let abs = posix_resolve(&spec.root, rel, spec.restrict)?;
     use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
+    // .ps1/.psm1/.psd1 加 UTF-8 BOM：与 Windows 路径一致，万一被 PowerShell 5.1 执行也能识别。
+    let lower = rel.to_lowercase();
+    let need_bom = lower.ends_with(".ps1") || lower.ends_with(".psm1") || lower.ends_with(".psd1");
+    let bytes: Vec<u8> = if need_bom {
+        let mut v = vec![0xEF, 0xBB, 0xBF];
+        v.extend_from_slice(content.as_bytes());
+        v
+    } else {
+        content.as_bytes().to_vec()
+    };
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
     let parent = match abs.rfind('/') {
         Some(0) | None => "/".to_string(),

@@ -255,6 +255,37 @@ pub async fn clear_project_remote(
     inner.projects.save()
 }
 
+/// 把"远程绝对路径或相对 root 的 rel"解析为规范化 rel。
+///
+/// 先按绝对路径尝试（必须落在 root 下），失败则当 rel 透传。
+/// 返回的 rel 统一用 `/` 分隔、不带前导 `/`，可直接喂给 win_resolve/posix_resolve。
+#[tauri::command]
+pub async fn remote_resolve_path(
+    project_id: String,
+    path: String,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<String, String> {
+    let spec = {
+        let inner = state.inner.lock().await;
+        inner
+            .projects
+            .remote_of(&project_id)
+            .ok_or_else(|| "当前项目不是远程项目".to_string())?
+    };
+    let p = path.trim();
+    if p.is_empty() {
+        return Err("路径为空".to_string());
+    }
+    // 先按绝对路径（在 root 下）；成功且非 root 本身则直接用。
+    if let Ok(rel) = crate::ide::backend::to_rel(&spec, p) {
+        if !rel.is_empty() {
+            return Ok(rel);
+        }
+    }
+    // 当 rel 用：统一分隔符、去掉前导斜杠（交给 resolve 再校验越界）。
+    Ok(p.replace('\\', "/").trim_start_matches('/').to_string())
+}
+
 /// SSH config 中的一条主机记录。
 #[derive(Debug, Clone, Serialize)]
 pub struct SshHost {
@@ -468,10 +499,219 @@ fn windows_terminal_remote_cmd(root: &str) -> String {
     cmd
 }
 
+// —— 独立 SSH 文件浏览器（不依赖项目）——
+// 约定：spec.root 即"当前浏览目录"的绝对路径，rel 传空。
+
+/// `ssh_list_dir` 的返回：真实解析后的当前目录路径 + 条目。
+///
+/// 前端传空 root 时，后端会用 `remote_browse` 探测默认目录，
+/// 并把真实路径回传，前端据此同步 `curAbs`。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SshListResult {
+    pub path: String,
+    pub entries: Vec<crate::ide::fs::DirEntry>,
+}
+
+#[tauri::command]
+pub async fn ssh_list_dir(spec: RemoteSpec, rel: String) -> Result<SshListResult, String> {
+    // root 为空：用 remote_browse 探测远端默认目录（Windows: USERPROFILE；POSIX: ~/home/<user>）。
+    let mut spec = spec;
+    if spec.root.trim().is_empty() {
+        let p = remote_browse(spec.clone(), String::new())
+            .await
+            .map_err(|e| format!("无法确定默认目录：{e}"))?;
+        if p.path.trim().is_empty() {
+            return Err("远端未能确定默认目录，请手动输入路径".to_string());
+        }
+        spec.root = p.path;
+    }
+    let entries = crate::ide::backend::list_dir(&spec, &rel).await?;
+    Ok(SshListResult {
+        path: spec.root,
+        entries,
+    })
+}
+
+#[tauri::command]
+pub async fn ssh_create(spec: RemoteSpec, rel: String, is_dir: bool) -> Result<(), String> {
+    crate::ide::backend::create(&spec, &rel, is_dir).await
+}
+
+#[tauri::command]
+pub async fn ssh_delete(spec: RemoteSpec, rel: String) -> Result<(), String> {
+    crate::ide::backend::delete(&spec, &rel).await
+}
+
+#[tauri::command]
+pub async fn ssh_rename(
+    spec: RemoteSpec,
+    from_rel: String,
+    to_rel: String,
+) -> Result<(), String> {
+    crate::ide::backend::rename(&spec, &from_rel, &to_rel).await
+}
+
+/// 移动远程文件/目录到目标目录（绝对路径入参；用远端命令，支持目录）。
+#[tauri::command]
+pub async fn ssh_move(
+    spec: RemoteSpec,
+    from_abs: String,
+    to_dir_abs: String,
+) -> Result<(), String> {
+    let sep = if from_abs.contains('\\') || from_abs.as_bytes().get(1) == Some(&b':') {
+        "\\"
+    } else {
+        "/"
+    };
+    let name = from_abs
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return Err("源路径无效".into());
+    }
+    let to_abs = format!(
+        "{}{}{}",
+        to_dir_abs.trim_end_matches(['/', '\\']),
+        sep,
+        name
+    );
+    if from_abs == to_abs {
+        return Ok(());
+    }
+    if crate::ide::backend::is_windows_remote(&spec).await {
+        let script = format!(
+            "if (-not (Test-Path -LiteralPath {f})) {{ [Console]::Error.Write('源不存在'); exit 2 }}; \
+             Move-Item -LiteralPath {f} -Destination {t} -Force",
+            f = crate::ide::backend::ps_lit(&from_abs),
+            t = crate::ide::backend::ps_lit(&to_abs),
+        );
+        let out = crate::ide::ssh::exec_ps(&spec, &script, std::time::Duration::from_secs(60)).await?;
+        if !out.ok() {
+            return Err(format!("移动失败：{}", out.stderr.trim()));
+        }
+    } else {
+        let cmd = format!(
+            "mv -f {} {}",
+            crate::ide::backend::shell_quote(&from_abs),
+            crate::ide::backend::shell_quote(&to_abs)
+        );
+        let out = crate::ide::ssh::exec_timeout(&spec, &cmd, std::time::Duration::from_secs(60)).await?;
+        if !out.ok() {
+            return Err(format!("移动失败：{}", out.stderr.trim()));
+        }
+    }
+    Ok(())
+}
+
+/// 读取远程二进制文件（base64），供 SSH 面板预览图片/PDF。
+#[tauri::command]
+pub async fn ssh_read_binary_b64(spec: RemoteSpec, abs: String) -> Result<String, String> {
+    let (root, rel) = split_abs(&abs)?;
+    let mut s = spec;
+    s.root = root;
+    let (bytes, _) = crate::ide::backend::read_binary(&s, &rel).await?;
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
+#[tauri::command]
+pub async fn ssh_download(
+    spec: RemoteSpec,
+    rel: String,
+    local_path: String,
+) -> Result<(), String> {
+    let (bytes, _) = crate::ide::backend::read_binary(&spec, &rel).await?;
+    if let Some(parent) = std::path::Path::new(&local_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&local_path, &bytes).map_err(|e| format!("写入本地文件失败：{e}"))
+}
+
+#[tauri::command]
+pub async fn ssh_upload(
+    spec: RemoteSpec,
+    local_path: String,
+    rel_dest: String,
+) -> Result<(), String> {
+    const MAX_XFER: u64 = 64 * 1024 * 1024;
+    let meta = std::fs::metadata(&local_path).map_err(|e| format!("读取本地文件失败：{e}"))?;
+    if meta.len() > MAX_XFER {
+        return Err(format!(
+            "文件过大（{} 字节，上限 {MAX_XFER} 字节）",
+            meta.len()
+        ));
+    }
+    let bytes = std::fs::read(&local_path).map_err(|e| format!("读取本地文件失败：{e}"))?;
+    crate::ide::transfer::write_remote_binary(&spec, &rel_dest, &bytes).await
+}
+
+/// 读取远程文件文本（供 SSH 面板编辑器用）。
+#[tauri::command]
+pub async fn ssh_read_text(spec: RemoteSpec, abs: String) -> Result<String, String> {
+    // abs 是绝对路径；转成 (root=父目录, rel=文件名) 交给 backend。
+    let (root, rel) = split_abs(&abs)?;
+    let mut s = spec;
+    s.root = root;
+    crate::ide::backend::read_file(&s, &rel).await
+}
+
+/// 写远程文件文本（供 SSH 面板编辑器保存）。
+#[tauri::command]
+pub async fn ssh_write_text(
+    spec: RemoteSpec,
+    abs: String,
+    content: String,
+) -> Result<(), String> {
+    let (root, rel) = split_abs(&abs)?;
+    let mut s = spec;
+    s.root = root;
+    crate::ide::backend::write_file(&s, &rel, &content).await
+}
+
+/// 拆分绝对路径为 (父目录, 文件名)，跨平台。
+fn split_abs(abs: &str) -> Result<(String, String), String> {
+    let p = abs.trim();
+    if p.is_empty() {
+        return Err("路径为空".into());
+    }
+    let win = p.as_bytes().get(1) == Some(&b':') || p.contains('\\');
+    let sep = if win { '\\' } else { '/' };
+    let norm = p.replace(['\\', '/'], &sep.to_string());
+    match norm.rfind(sep) {
+        Some(i) if i > 0 => {
+            let root = norm[..i].to_string();
+            let name = norm[i + 1..].to_string();
+            if name.is_empty() {
+                return Err("路径无效".into());
+            }
+            Ok((root, name))
+        }
+        _ => Err(format!("无法拆分路径：{abs}")),
+    }
+}
+
+/// 按 RemoteSpec 直接构造终端参数（供独立 SSH 面板用，不依赖项目）。
+#[tauri::command]
+pub async fn ssh_terminal_argv(spec: RemoteSpec) -> Result<TerminalArgv, String> {
+    let (mut args, label) = crate::ide::ssh::terminal_argv(&spec);
+    if crate::ide::backend::is_windows_remote(&spec).await {
+        args.pop();
+        args.push(windows_terminal_remote_cmd(&spec.root));
+    }
+    Ok(TerminalArgv {
+        prog: "ssh".to_string(),
+        args,
+        label,
+        root: spec.root.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn windows_terminal_cmd_no_posix() {
         let c = windows_terminal_remote_cmd("C:\\Users\\z\\Desktop");

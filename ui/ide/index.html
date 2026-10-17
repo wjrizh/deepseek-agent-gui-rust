@@ -45,6 +45,9 @@
           <svg viewBox="0 0 24 24" width="22" height="22" fill="none"><circle cx="7" cy="6" r="2.2" stroke="currentColor" stroke-width="1.5"/><circle cx="7" cy="18" r="2.2" stroke="currentColor" stroke-width="1.5"/><circle cx="17" cy="9" r="2.2" stroke="currentColor" stroke-width="1.5"/><path d="M7 8.2v7.6M17 11.2c0 3-2.5 4-6 4.3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
           <span id="act-scm-badge" class="act-badge hidden"></span>
         </button>
+        <button class="act-item" data-view="ssh" title="SSH 文件浏览">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none"><rect x="3" y="4" width="18" height="14" rx="2.5" stroke="currentColor" stroke-width="1.5"/><path d="M7 20h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M8 9l2.5 2.5L8 14M12.5 14H16" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
       </div>
 
       <!-- 资源管理器面板 -->
@@ -98,6 +101,33 @@
             <button id="scm-push-btn" class="scm-btn" title="推送到远程">推送</button>
           </div>
         </div>
+      </div>
+
+      <!-- SSH 文件浏览器（独立于项目，支持多主机） -->
+      <div class="sidebar-pane ssh-pane hidden" id="ssh-pane">
+        <div class="sidebar-head">
+          <span class="sidebar-title">SSH</span>
+          <div class="sidebar-actions">
+            <button id="ssh-up" class="icon-btn" title="上一层">↑</button>
+            <button id="ssh-refresh" class="icon-btn" title="刷新">⟳</button>
+          </div>
+        </div>
+        <div class="ssh-host-row">
+          <select id="ssh-host" class="ssh-host-select">
+            <option value="">— 选择主机 —</option>
+          </select>
+        </div>
+        <div id="ssh-tabs" class="ssh-tabs"></div>
+        <div class="ssh-path-row">
+          <input id="ssh-path" class="ssh-path-input" placeholder="远程绝对路径，回车跳转" />
+        </div>
+        <div class="ssh-actions">
+          <button id="ssh-terminal" class="ssh-act" title="在该主机打开终端">⌨ 终端</button>
+          <button id="ssh-upload" class="ssh-act" title="上传到当前目录">⬆ 上传</button>
+          <button id="ssh-newfile" class="ssh-act" title="新建文件">＋文件</button>
+          <button id="ssh-newdir" class="ssh-act" title="新建目录">＋目录</button>
+        </div>
+        <div id="ssh-list" class="ssh-list"></div>
       </div>
     </aside>
 
